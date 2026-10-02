@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% block head %}{% if upload.status == 'reading' %}<meta http-equiv="refresh" content="2">{% endif %}{% endblock %}
+{% block title %}Review {{ upload.filename }}{% endblock %}
+{% block content %}
+<p class="muted">Photo {{ position }} of {{ total }} · {{ upload.filename }}</p>
+<div class="review">
+  <div class="photo"><img src="/uploads/{{ upload.id }}/image" alt="Uploaded note {{ upload.filename }}"></div>
+  <form method="post" action="/review/{{ upload.id }}" class="card">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    {% if upload.status == 'reading' %}
+      <p class="alert">Reading the handwriting… this page refreshes automatically.</p>
+    {% elif upload.status == 'failed' %}
+      <p class="alert error">Couldn't read this photo: {{ upload.error }} Enter the fields manually or skip it.</p>
+    {% else %}
+      <p>Check every field against the photo before saving.</p>
+    {% endif %}
+
+    {% for key in fields %}
+      {% set problem = problems.get(key) %}
+      <label class="{{ 'invalid' if problem else ('uncertain' if key in uncertain else '') }}">
+        {{ labels.get(key, key) }}
+        {% if key in choices %}
+          <select name="{{ key }}" {{ 'disabled' if upload.status == 'reading' }}>
+            <option value=""></option>
+            {% for c in choices[key] %}<option {{ 'selected' if values[key] == c }}>{{ c }}</option>{% endfor %}
+            {% if values[key] and values[key] not in choices[key] %}<option selected>{{ values[key] }}</option>{% endif %}
+          </select>
+        {% elif key == 'TestDate' %}
+          <input name="{{ key }}" value="{{ values[key] or '' }}" placeholder="YYYY-MM-DD" {{ 'disabled' if upload.status == 'reading' }}>
+        {% else %}
+          <input name="{{ key }}" value="{{ values[key] or '' }}" {{ 'disabled' if upload.status == 'reading' }}>
+        {% endif %}
+        {% if problem %}<small>{{ problem }}</small>{% elif key in uncertain %}<small>Hard to read — double-check</small>{% endif %}
+      </label>
+    {% endfor %}
+
+    {% if uncertain and upload.status == 'ready' %}
+      <label class="check"><input type="checkbox" name="confirm_uncertain" value="1">
+        I checked the highlighted fields against the photo</label>
+    {% endif %}
+    {% if duplicate %}
+      <div class="alert error">
+        A {{ duplicate.TestType }} test for {{ duplicate.Name }} on {{ duplicate.TestDate }} is already recorded
+        (result: <strong>{{ duplicate.Result }}</strong>, entered by {{ duplicate.EnteredBy }}).
+        <label class="check"><input type="checkbox" name="confirm_duplicate" value="1"> Save this one anyway</label>
+      </div>
+    {% endif %}
+
+    <div class="actions">
+      <button class="primary" name="action" value="save" {{ 'disabled' if upload.status == 'reading' }}>Save and next</button>
+      <button name="action" value="skip" formnovalidate>Skip and delete photo</button>
+    </div>
+  </form>
+</div>
+{% endblock %}

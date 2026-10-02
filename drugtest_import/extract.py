@@ -2,6 +2,7 @@
 import base64
 import io
 import os
+from typing import BinaryIO
 
 import anthropic
 from PIL import Image, ImageOps
@@ -27,12 +28,13 @@ class ExtractionError(Exception):
     pass
 
 
-def encode_image(image_path: str) -> tuple[str, str]:
+def encode_image(image: str | BinaryIO) -> tuple[str, str]:
     """Return (media_type, base64 data) for a JPEG version of the image, auto-rotated and resized.
 
-    Works in memory so no temp files with sensitive content are left on disk.
+    `image` is a file path or a binary file object. Works in memory so no temp
+    files with sensitive content are left on disk.
     """
-    with Image.open(image_path) as img:
+    with Image.open(image) as img:
         img = ImageOps.exif_transpose(img).convert("RGB")
         img.thumbnail((MAX_SIDE, MAX_SIDE), Image.Resampling.LANCZOS)
         buffer = io.BytesIO()
@@ -40,9 +42,9 @@ def encode_image(image_path: str) -> tuple[str, str]:
     return "image/jpeg", base64.standard_b64encode(buffer.getvalue()).decode("ascii")
 
 
-def extract_fields(image_path: str, client: anthropic.Anthropic | None = None) -> Extraction:
+def extract_fields(image: str | BinaryIO, client: anthropic.Anthropic | None = None) -> Extraction:
     client = client or anthropic.Anthropic()
-    media_type, data = encode_image(image_path)
+    media_type, data = encode_image(image)
     try:
         response = client.beta.messages.parse(
             model=MODEL,

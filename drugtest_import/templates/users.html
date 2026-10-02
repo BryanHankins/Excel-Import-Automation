@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block title %}Users{% endblock %}
+{% block content %}
+<h1>Users</h1>
+<p class="muted">Viewers can see records. Reviewers can also upload, review and export. Admins can also manage users and see the audit log.</p>
+<table>
+  <thead><tr><th>Username</th><th>Role</th><th>Status</th><th>Last sign-in</th><th>Change</th></tr></thead>
+  <tbody>
+  {% for u in users %}
+    <tr>
+      <td>{{ u.username }}</td>
+      <td>{{ u.role }}</td>
+      <td>{{ 'Active' if u.active else 'Disabled' }}</td>
+      <td>{{ (u.last_login or '')[:16].replace('T', ' ') }}</td>
+      <td>
+        <form method="post" action="/admin/users/{{ u.id }}" class="inline">
+          <input type="hidden" name="csrf" value="{{ csrf }}">
+          <select name="role">{% for r in roles %}<option {{ 'selected' if u.role == r }}>{{ r }}</option>{% endfor %}</select>
+          <input type="password" name="password" placeholder="New password (optional)" autocomplete="new-password">
+          <button>Update</button>
+          <button name="action" value="{{ 'disable' if u.active else 'enable' }}">{{ 'Disable' if u.active else 'Enable' }}</button>
+        </form>
+      </td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+
+<h2>Add user</h2>
+<form method="post" action="/admin/users" class="card inline">
+  <input type="hidden" name="csrf" value="{{ csrf }}">
+  <input name="username" placeholder="Username" required autocomplete="off">
+  <input type="password" name="password" placeholder="Password (12+ characters)" minlength="12" required autocomplete="new-password">
+  <select name="role">{% for r in roles %}<option {{ 'selected' if r == 'viewer' }}>{{ r }}</option>{% endfor %}</select>
+  <button class="primary">Add user</button>
+</form>
+{% endblock %}

@@ -1,4 +1,5 @@
 """Desktop app: pick photos, let Claude read them, review/correct each one, then save."""
+import getpass
 import os
 import queue
 import tkinter as tk
@@ -7,12 +8,14 @@ from tkinter import filedialog, messagebox, ttk
 
 from PIL import Image, ImageOps, ImageTk
 
+from .crypto import Cipher, ConfigError
 from .extract import ExtractionError, extract_fields
 from .schema import FIELDS, RESULTS, TEST_TYPES, normalize, validate
-from .storage import RecordStore
+from .storage import Database
 
 DB_FILE = os.environ.get("DRUGTEST_DB", "drugtest.db")
 LEGACY_CSV = os.environ.get("DRUGTEST_CSV", "DrugTestingOrganizer.csv")
+ACTOR = f"desktop:{getpass.getuser()}"
 PARALLEL_READS = 3
 PREVIEW_SIZE = (420, 520)
 CHOICES = {"TestType": TEST_TYPES, "Result": RESULTS}
@@ -20,7 +23,7 @@ LABELS = {"EmployeeID": "Employee ID", "TestDate": "Test date (YYYY-MM-DD)", "Te
 
 
 class ReviewApp:
-    def __init__(self, root: tk.Tk, store: RecordStore):
+    def __init__(self, root: tk.Tk, store: Database):
         self.root = root
         self.store = store
         self.root.title("Drug Test Import")
@@ -206,7 +209,7 @@ class ReviewApp:
             f"is already recorded (result: {duplicate['Result']}).\n\nSave this one anyway?",
         ):
             return
-        self.store.add(record, source_file=self.current)
+        self.store.add_record(record, ACTOR, source_file=self.current)
         self.saved += 1
         self.advance()
 
@@ -222,6 +225,7 @@ class ReviewApp:
             return
         try:
             count = self.store.export_xlsx(path)
+            self.store.log(ACTOR, "records.export", detail=f"{count} rows")
         except OSError as e:
             messagebox.showerror("Export failed", f"Could not write {path}: {e}\nIs it open in Excel?")
             return
@@ -250,18 +254,24 @@ class ReviewApp:
         self.root.destroy()
 
 
-def open_store() -> tuple[RecordStore, str | None]:
+def open_store() -> tuple[Database, str | None]:
     """Open the database, importing the CSV log from earlier versions on first run."""
-    store = RecordStore(DB_FILE)
+    store = Database(DB_FILE, Cipher.from_env())
     if store.count() == 0 and os.path.exists(LEGACY_CSV):
-        imported, skipped = store.import_csv(LEGACY_CSV)
+        imported, skipped = store.import_csv(LEGACY_CSV, ACTOR)
         message = f"Imported {imported} records from {LEGACY_CSV}"
         return store, message + (f" ({skipped} incomplete rows skipped)." if skipped else ".")
     return store, None
 
 
 def main():
-    store, message = open_store()
+    try:
+        store, message = open_store()
+    except ConfigError as e:
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror("Can't open records", str(e))
+        return
     root = tk.Tk()
     app = ReviewApp(root, store)
     if message:

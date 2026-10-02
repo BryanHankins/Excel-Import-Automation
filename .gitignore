@@ -4,6 +4,7 @@
 *.xlsx
 *.db
 *.db-journal
+uploads/
 *.jpg
 *.jpeg
 *.png

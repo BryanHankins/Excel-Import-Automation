@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block head %}{% if reading %}<meta http-equiv="refresh" content="3">{% endif %}{% endblock %}
+{% block title %}Review{% endblock %}
+{% block content %}
+<h1>Upload photos</h1>
+<form method="post" action="/uploads" enctype="multipart/form-data" class="card">
+  <input type="hidden" name="csrf" value="{{ csrf }}">
+  <input type="file" name="files" accept="image/jpeg,image/png,image/webp" multiple required>
+  <button class="primary">Upload and read</button>
+  <p class="muted">JPEG, PNG or WebP, up to {{ max_mb }} MB each, {{ max_files }} at a time.</p>
+</form>
+
+<h2>Waiting for review ({{ uploads|length }})</h2>
+{% if uploads %}
+<p><a class="button primary" href="/review/next">Review next</a></p>
+<table>
+  <thead><tr><th>File</th><th>Status</th><th>Uploaded by</th><th>Uploaded</th><th></th></tr></thead>
+  <tbody>
+  {% for u in uploads %}
+    <tr>
+      <td>{{ u.filename }}</td>
+      <td><span class="tag {{ u.status }}">{{ {'reading': 'Reading…', 'ready': 'Ready', 'failed': 'Needs manual entry'}[u.status] }}</span></td>
+      <td>{{ u.uploaded_by }}</td>
+      <td>{{ u.created_at[:16].replace('T', ' ') }} UTC</td>
+      <td><a href="/review/{{ u.id }}">Review</a></td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="muted">Nothing waiting. Upload photos above.</p>
+{% endif %}
+{% endblock %}

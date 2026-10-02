@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  {% block head %}{% endblock %}
+  <title>{% block title %}Drug Test Import{% endblock %}</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/">Drug Test Import</a>
+    {% if user %}
+    <nav>
+      {% if can('reviewer') %}<a href="/review">Review</a>{% endif %}
+      <a href="/records">Records</a>
+      {% if can('admin') %}<a href="/admin/users">Users</a><a href="/admin/audit">Audit log</a>{% endif %}
+    </nav>
+    <form method="post" action="/logout" class="signout">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <span class="muted">{{ user.username }} · {{ user.role }}</span>
+      <button class="link">Sign out</button>
+    </form>
+    {% endif %}
+  </header>
+  <main>
+    {% if error %}<p class="alert error">{{ error }}</p>{% endif %}
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>
