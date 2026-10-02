@@ -1,0 +1,13 @@
+# Real test records are confidential - never commit them
+*.csv
+!examples/*.csv
+*.xlsx
+*.jpg
+*.jpeg
+*.png
+*.webp
+.env
+__pycache__/
+.pytest_cache/
+.venv/
+venv/
