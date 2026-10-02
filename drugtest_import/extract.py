@@ -1,4 +1,4 @@
-"""Read a photo of a handwritten note with Claude's vision model and return structured fields."""
+"""Read a photo of a form with Claude's vision model and return the fields its form type defines."""
 import base64
 import io
 import os
@@ -7,21 +7,10 @@ from typing import BinaryIO
 import anthropic
 from PIL import Image, ImageOps
 
-from .schema import Extraction
+from .forms import FormTemplate, extraction_model, extraction_prompt, extraction_values
 
 MODEL = os.environ.get("DRUGTEST_MODEL", "claude-opus-5-5")
 MAX_SIDE = 1568  # larger images are downscaled by the API anyway
-
-PROMPT = """This image is a handwritten note or form recording an employee drug test.
-Transcribe these fields exactly as written: EmployeeID, Name, Department, TestDate,
-TestType, Result, Notes. Labels may be abbreviated, misspelled or missing; infer which
-value belongs to which field from context.
-
-Rules:
-- Never guess. If a field is absent or unreadable, return null for it.
-- List in uncertain_fields every field you are not confident you read correctly,
-  especially Result, TestDate and EmployeeID - a wrong Result is a serious error.
-- Do not correct or reformat values beyond fixing obvious letter-shape confusions."""
 
 
 class ExtractionError(Exception):
@@ -42,7 +31,9 @@ def encode_image(image: str | BinaryIO) -> tuple[str, str]:
     return "image/jpeg", base64.standard_b64encode(buffer.getvalue()).decode("ascii")
 
 
-def extract_fields(image: str | BinaryIO, client: anthropic.Anthropic | None = None) -> Extraction:
+def extract_fields(image: str | BinaryIO, form: FormTemplate,
+                   client: anthropic.Anthropic | None = None) -> tuple[dict, list[str]]:
+    """Read the form in the image. Returns ({field key: value or None}, keys of hard-to-read fields)."""
     client = client or anthropic.Anthropic()
     media_type, data = encode_image(image)
     try:
@@ -56,10 +47,10 @@ def extract_fields(image: str | BinaryIO, client: anthropic.Anthropic | None = N
                 "role": "user",
                 "content": [
                     {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": data}},
-                    {"type": "text", "text": PROMPT},
+                    {"type": "text", "text": extraction_prompt(form)},
                 ],
             }],
-            output_format=Extraction,
+            output_format=extraction_model(form),
         )
     except anthropic.AuthenticationError as e:
         raise ExtractionError("Invalid API key. Set ANTHROPIC_API_KEY.") from e
@@ -74,4 +65,4 @@ def extract_fields(image: str | BinaryIO, client: anthropic.Anthropic | None = N
         raise ExtractionError("The model declined to read this image. Enter the fields manually.")
     if response.stop_reason == "max_tokens" or response.parsed_output is None:
         raise ExtractionError("The model returned an incomplete answer. Try again or enter fields manually.")
-    return response.parsed_output
+    return extraction_values(form, response.parsed_output)

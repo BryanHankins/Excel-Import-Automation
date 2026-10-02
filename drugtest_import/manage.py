@@ -3,7 +3,8 @@
   python -m drugtest_import.manage gen-key
   python -m drugtest_import.manage create-user NAME --role admin|reviewer|viewer
   python -m drugtest_import.manage set-password NAME
-  python -m drugtest_import.manage import-csv PATH
+  python -m drugtest_import.manage import-csv PATH [--form FORM_KEY]
+  python -m drugtest_import.manage list-forms
 """
 import argparse
 import getpass
@@ -36,8 +37,10 @@ def main(argv=None):
     create.add_argument("--role", choices=ROLES, required=True)
     reset = commands.add_parser("set-password", help="reset a user's password")
     reset.add_argument("username")
-    imp = commands.add_parser("import-csv", help="import records from the old CSV format")
+    imp = commands.add_parser("import-csv", help="import records from a CSV (headers = field labels or keys)")
     imp.add_argument("path")
+    imp.add_argument("--form", default="drug-test", help="form type key (see list-forms)")
+    commands.add_parser("list-forms", help="list form types and their keys")
     args = parser.parse_args(argv)
 
     if args.command == "gen-key":
@@ -57,8 +60,14 @@ def main(argv=None):
             db.update_user(user["id"], ACTOR, password=ask_password())
             print(f"Password updated for {args.username}")
         elif args.command == "import-csv":
-            imported, skipped = db.import_csv(args.path, ACTOR)
-            print(f"Imported {imported} records, skipped {skipped} incomplete rows")
+            form = db.get_form(args.form)
+            if not form:
+                raise ValueError(f"No form type {args.form!r}. See list-forms.")
+            imported, skipped = db.import_csv(args.path, ACTOR, form)
+            print(f"Imported {imported} {form.name} records, skipped {skipped} incomplete rows")
+        elif args.command == "list-forms":
+            for form in db.forms():
+                print(f"{form.key:24} {form.name} ({db.count(form.key)} records)")
     except (ConfigError, ValueError, OSError) as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1

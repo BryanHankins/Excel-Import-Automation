@@ -1,4 +1,4 @@
-"""SQLite storage: encrypted records, uploads awaiting review, users and the audit log."""
+"""SQLite storage: form types, encrypted entries, uploads awaiting review, users and the audit log."""
 import csv
 import json
 import os
@@ -13,35 +13,38 @@ from openpyxl.formatting.rule import FormulaRule
 from openpyxl.styles import Font, PatternFill
 
 from .crypto import Cipher, ConfigError, hash_password
-from .schema import FIELDS, normalize, validate
+from .forms import BUILT_IN_FORMS, DRUG_TEST, LEGACY_DRUG_TEST_COLUMNS, FormTemplate, normalize, validate
 
 ROLES = ["admin", "reviewer", "viewer"]
-UPLOAD_STATES = ("reading", "ready", "failed")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value BLOB);
 
-CREATE TABLE IF NOT EXISTS records (
+CREATE TABLE IF NOT EXISTS forms (
+    key TEXT PRIMARY KEY,
+    definition TEXT NOT NULL,   -- FormTemplate JSON (field names, not data - not encrypted)
+    updated_at TEXT NOT NULL,
+    updated_by TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS entries (
     id INTEGER PRIMARY KEY,
-    employee_id BLOB,           -- encrypted
-    employee_index TEXT,        -- keyed hash for exact matching
-    name BLOB NOT NULL,         -- encrypted
-    name_index TEXT NOT NULL,
-    department TEXT,
-    test_date TEXT NOT NULL,
-    test_type TEXT NOT NULL,
-    result BLOB NOT NULL,       -- encrypted
-    notes BLOB,                 -- encrypted
+    form_key TEXT NOT NULL REFERENCES forms (key),
+    data BLOB NOT NULL,         -- encrypted JSON of field values
+    duplicate_index TEXT,       -- keyed hash of the form's duplicate-check fields
+    record_date TEXT,           -- the form's date field, for sorting and date filters
     source_file BLOB,           -- encrypted (file names often contain names)
     created_at TEXT NOT NULL,
     created_by TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS records_lookup ON records (name_index, test_date, test_type);
+CREATE INDEX IF NOT EXISTS entries_form ON entries (form_key, record_date);
+CREATE INDEX IF NOT EXISTS entries_duplicates ON entries (form_key, duplicate_index);
 
 CREATE TABLE IF NOT EXISTS uploads (
     id TEXT PRIMARY KEY,
+    form_key TEXT NOT NULL REFERENCES forms (key),
     filename BLOB NOT NULL,     -- encrypted
-    status TEXT NOT NULL,
+    status TEXT NOT NULL,       -- reading | ready | failed
     extraction BLOB,            -- encrypted JSON
     error TEXT,
     uploaded_by TEXT NOT NULL,
@@ -72,9 +75,12 @@ CREATE TRIGGER IF NOT EXISTS audit_log_no_delete BEFORE DELETE ON audit_log
 BEGIN SELECT RAISE(ABORT, 'audit log is append-only'); END;
 """
 
-EXPORT_HEADERS = FIELDS + ["SourceFile", "EnteredAt", "EnteredBy"]
-COLUMN_WIDTHS = [12, 24, 16, 12, 10, 13, 40, 24, 20, 14]
-RESULT_FILLS = {"Positive": "FECACA", "Pending": "FEF08A", "Inconclusive": "FEF08A", "Refused": "FED7AA"}
+COLUMN_WIDTH = {"longtext": 40, "text": 22, "id": 14, "date": 12, "number": 10, "choice": 14}
+FLAG_FILL = "FECACA"
+
+
+class FormInUse(ValueError):
+    pass
 
 
 def now() -> str:
@@ -106,16 +112,50 @@ class Database:
         self.conn = sqlite3.connect(path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
-        self.conn.executescript(SCHEMA)
         self._check_key()
+        legacy_records = self._columns("records")
+        legacy_uploads = self._columns("uploads") and "form_key" not in self._columns("uploads")
+        if legacy_uploads:
+            self.conn.execute("ALTER TABLE uploads RENAME TO uploads_v1")
+        self.conn.executescript(SCHEMA)
+        if not self._fetchone("SELECT 1 FROM forms LIMIT 1"):
+            for form in BUILT_IN_FORMS:
+                self._write_form(form, "system")
+        if legacy_records or legacy_uploads:
+            self._migrate_v1(legacy_records, legacy_uploads)
+
+    def _columns(self, table: str) -> list[str]:
+        return [row[1] for row in self.conn.execute(f"PRAGMA table_info({table})")]
 
     def _check_key(self):
         """Fail fast if the configured key isn't the one this database was created with."""
+        self.conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value BLOB)")
         row = self._fetchone("SELECT value FROM meta WHERE key = 'key_check'")
         if row is None:
             self._execute("INSERT INTO meta (key, value) VALUES ('key_check', ?)", (self.cipher.encrypt("ok"),))
         elif self.cipher.decrypt(row["value"]) != "ok":
             raise ConfigError("DRUGTEST_KEY doesn't match this database.")
+
+    def _migrate_v1(self, legacy_records: bool, legacy_uploads: bool) -> None:
+        """Move data from the drug-test-only tables of earlier versions into the form-type tables."""
+        c = self.cipher
+        with self._lock, self.conn:
+            if legacy_records:
+                for row in self.conn.execute("SELECT * FROM records ORDER BY id").fetchall():
+                    values = {
+                        "employee_id": c.decrypt(row["employee_id"]), "name": c.decrypt(row["name"]),
+                        "department": row["department"], "test_date": row["test_date"],
+                        "test_type": row["test_type"], "result": c.decrypt(row["result"]),
+                        "notes": c.decrypt(row["notes"]),
+                    }
+                    self._insert_entry(DRUG_TEST, values, row["created_by"], row["source_file"], row["created_at"])
+                self.conn.execute("DROP TABLE records")
+            if legacy_uploads:
+                self.conn.execute(
+                    "INSERT INTO uploads (id, form_key, filename, status, extraction, error, uploaded_by, created_at) "
+                    "SELECT id, 'drug-test', filename, 'reading', NULL, NULL, uploaded_by, created_at FROM uploads_v1"
+                )
+                self.conn.execute("DROP TABLE uploads_v1")
 
     def close(self):
         with self._lock:
@@ -145,88 +185,145 @@ class Database:
         rows = self._fetchall("SELECT * FROM audit_log ORDER BY id DESC LIMIT ?", (limit,))
         return [dict(row) for row in rows]
 
-    # --- records ----------------------------------------------------------
+    # --- form types -------------------------------------------------------
 
-    def add_record(self, record: dict, actor: str, source_file: str | None = None) -> int:
-        """Insert a validated record. Only the file's base name is kept, not its full path."""
-        c = self.cipher
-        values = {
-            "employee_id": c.encrypt(record.get("EmployeeID")),
-            "employee_index": c.index(record.get("EmployeeID")),
-            "name": c.encrypt(record["Name"]),
-            "name_index": c.index(record["Name"]),
-            "department": record.get("Department"),
-            "test_date": record["TestDate"],
-            "test_type": record["TestType"],
-            "result": c.encrypt(record["Result"]),
-            "notes": c.encrypt(record.get("Notes")),
-            "source_file": c.encrypt(os.path.basename(source_file)) if source_file else None,
-            "created_at": now(),
-            "created_by": actor,
-        }
+    def forms(self) -> list[FormTemplate]:
+        rows = self._fetchall("SELECT definition FROM forms ORDER BY key")
+        forms = [FormTemplate.model_validate_json(row["definition"]) for row in rows]
+        return sorted(forms, key=lambda f: f.name.lower())
+
+    def get_form(self, key: str) -> FormTemplate | None:
+        row = self._fetchone("SELECT definition FROM forms WHERE key = ?", (key,))
+        return FormTemplate.model_validate_json(row["definition"]) if row else None
+
+    def _write_form(self, form: FormTemplate, actor: str) -> None:
+        self.conn.execute(
+            "INSERT INTO forms (key, definition, updated_at, updated_by) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT (key) DO UPDATE SET definition = excluded.definition, "
+            "updated_at = excluded.updated_at, updated_by = excluded.updated_by",
+            (form.key, form.model_dump_json(), now(), actor),
+        )
+
+    def save_form(self, form: FormTemplate, actor: str) -> None:
+        """Create or update a form type.
+
+        Once a form type has entries its fields can't be removed or change type,
+        so stored data always matches a field. Labels, choices, hints and
+        required/duplicate flags can still change.
+        """
+        existing = self.get_form(form.key)
+        if existing and self.count(form.key):
+            new = {f.key: f for f in form.fields}
+            for old in existing.fields:
+                if old.key not in new:
+                    raise FormInUse(f"'{old.label}' can't be removed: entries already use it.")
+                if new[old.key].type != old.type:
+                    raise FormInUse(f"'{old.label}' can't change type: entries already use it.")
         with self._lock, self.conn:
-            cursor = self.conn.execute(
-                f"INSERT INTO records ({', '.join(values)}) VALUES ({', '.join('?' * len(values))})",
-                list(values.values()),
-            )
+            self._write_form(form, actor)
+            if existing and existing.duplicate_keys != form.duplicate_keys:
+                self._reindex(form)
             self.conn.execute(
-                "INSERT INTO audit_log (at, actor, action, target) VALUES (?, ?, 'record.create', ?)",
-                (now(), actor, str(cursor.lastrowid)),
+                "INSERT INTO audit_log (at, actor, action, target) VALUES (?, ?, ?, ?)",
+                (now(), actor, "form.update" if existing else "form.create", form.key),
             )
+
+    def delete_form(self, key: str, actor: str) -> None:
+        if self.count(key) or self._fetchone("SELECT 1 FROM uploads WHERE form_key = ?", (key,)):
+            raise FormInUse("This form type has entries or uploads, so it can't be deleted.")
+        if len(self.forms()) <= 1:
+            raise FormInUse("At least one form type is needed.")
+        with self._lock, self.conn:
+            self.conn.execute("DELETE FROM forms WHERE key = ?", (key,))
+            self.conn.execute(
+                "INSERT INTO audit_log (at, actor, action, target) VALUES (?, ?, 'form.delete', ?)",
+                (now(), actor, key),
+            )
+
+    # --- entries ----------------------------------------------------------
+
+    def _duplicate_index(self, form: FormTemplate, values: dict) -> str | None:
+        keys = form.duplicate_keys
+        if not keys or not all(values.get(k) for k in keys):
+            return None
+        return self.cipher.index(json.dumps([values[k] for k in keys]))
+
+    def _insert_entry(self, form, values, actor, source_file_token, created_at) -> int:
+        cursor = self.conn.execute(
+            "INSERT INTO entries (form_key, data, duplicate_index, record_date, source_file, created_at, created_by) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (form.key, self.cipher.encrypt(json.dumps(values)), self._duplicate_index(form, values),
+             values.get(form.date_field) if form.date_field else None, source_file_token, created_at, actor),
+        )
         return cursor.lastrowid
 
-    def find_duplicate(self, record: dict) -> dict | None:
-        """Return an existing record for the same person, date and test type, if any.
+    def _reindex(self, form: FormTemplate) -> None:
+        for row in self.conn.execute("SELECT id, data FROM entries WHERE form_key = ?", (form.key,)).fetchall():
+            values = json.loads(self.cipher.decrypt(row["data"]))
+            self.conn.execute("UPDATE entries SET duplicate_index = ? WHERE id = ?",
+                              (self._duplicate_index(form, values), row["id"]))
 
-        Different employee IDs mean different people; a missing ID on either side still matches.
-        """
-        employee_index = self.cipher.index(record.get("EmployeeID"))
-        row = self._fetchone(
-            "SELECT * FROM records WHERE name_index = ? AND test_date = ? AND test_type = ? "
-            "AND (employee_index IS ? OR ? IS NULL OR employee_index IS NULL) LIMIT 1",
-            (self.cipher.index(record.get("Name")), record.get("TestDate"), record.get("TestType"),
-             employee_index, employee_index),
-        )
-        return self._to_record(row) if row else None
+    def add_entry(self, form: FormTemplate, values: dict, actor: str, source_file: str | None = None) -> int:
+        """Insert validated values. Only the file's base name is kept, not its full path."""
+        values = {key: values.get(key) for key in form.keys}
+        token = self.cipher.encrypt(os.path.basename(source_file)) if source_file else None
+        with self._lock, self.conn:
+            entry_id = self._insert_entry(form, values, actor, token, now())
+            self.conn.execute(
+                "INSERT INTO audit_log (at, actor, action, target) VALUES (?, ?, 'entry.create', ?)",
+                (now(), actor, f"{form.key}/{entry_id}"),
+            )
+        return entry_id
 
-    def records(self) -> list[dict]:
-        rows = self._fetchall("SELECT * FROM records ORDER BY test_date DESC, id DESC")
-        return [self._to_record(row) for row in rows]
+    def find_duplicate(self, form: FormTemplate, values: dict) -> dict | None:
+        """Return an existing entry of this form type whose duplicate-check fields all match."""
+        index = self._duplicate_index(form, values)
+        if not index:
+            return None
+        row = self._fetchone("SELECT * FROM entries WHERE form_key = ? AND duplicate_index = ? LIMIT 1",
+                             (form.key, index))
+        return self._to_entry(row) if row else None
 
-    def count(self) -> int:
-        return self._fetchone("SELECT count(*) FROM records")[0]
+    def entries(self, form_key: str) -> list[dict]:
+        rows = self._fetchall(
+            "SELECT * FROM entries WHERE form_key = ? ORDER BY record_date DESC, id DESC", (form_key,))
+        return [self._to_entry(row) for row in rows]
 
-    def import_csv(self, path: str, actor: str) -> tuple[int, int]:
-        """Load records from a CSV produced by earlier versions.
+    def count(self, form_key: str | None = None) -> int:
+        if form_key is None:
+            return self._fetchone("SELECT count(*) FROM entries")[0]
+        return self._fetchone("SELECT count(*) FROM entries WHERE form_key = ?", (form_key,))[0]
+
+    def import_csv(self, path: str, actor: str, form: FormTemplate = DRUG_TEST) -> tuple[int, int]:
+        """Load entries from a CSV whose headers are field keys or labels (or the old drug-test headers).
 
         Returns (imported, skipped); rows that fail validation are skipped.
         """
+        form = self.get_form(form.key) or form
+        by_header = {f.key: f.key for f in form.fields} | {f.label.lower(): f.key for f in form.fields}
+        if form.key == DRUG_TEST.key:
+            by_header |= {h.lower(): k for h, k in LEGACY_DRUG_TEST_COLUMNS.items()}
         imported = skipped = 0
         with open(path, newline="", encoding="utf-8-sig") as f:
             for row in csv.DictReader(f):
-                record = normalize(row)
-                if validate(record):
+                mapped = {by_header.get(h, by_header.get((h or "").lower())): v for h, v in row.items()}
+                values = normalize(form, mapped)
+                if validate(form, values):
                     skipped += 1
                     continue
-                self.add_record(record, actor, source_file=path)
+                self.add_entry(form, values, actor, source_file=path)
                 imported += 1
-        self.log(actor, "records.import_csv", os.path.basename(path), f"{imported} imported, {skipped} skipped")
+        self.log(actor, "entries.import_csv", form.key, f"{os.path.basename(path)}: {imported} imported, {skipped} skipped")
         return imported, skipped
 
-    def _to_record(self, row: sqlite3.Row) -> dict:
-        c = self.cipher
+    def _to_entry(self, row: sqlite3.Row) -> dict:
         return {
             "id": row["id"],
-            "EmployeeID": c.decrypt(row["employee_id"]),
-            "Name": c.decrypt(row["name"]),
-            "Department": row["department"],
-            "TestDate": row["test_date"],
-            "TestType": row["test_type"],
-            "Result": c.decrypt(row["result"]),
-            "Notes": c.decrypt(row["notes"]),
-            "SourceFile": c.decrypt(row["source_file"]),
-            "EnteredAt": row["created_at"],
-            "EnteredBy": row["created_by"],
+            "form_key": row["form_key"],
+            "values": json.loads(self.cipher.decrypt(row["data"])),
+            "source_file": self.cipher.decrypt(row["source_file"]),
+            "entered_at": row["created_at"],
+            "entered_by": row["created_by"],
         }
 
     # --- uploads awaiting review -----------------------------------------
@@ -234,17 +331,18 @@ class Database:
     def _upload_path(self, upload_id: str) -> str:
         return os.path.join(self.uploads_dir, f"{uuid.UUID(upload_id)}.bin")
 
-    def create_upload(self, filename: str, data: bytes, actor: str) -> str:
+    def create_upload(self, filename: str, data: bytes, form_key: str, actor: str) -> str:
         """Store an uploaded image encrypted on disk until it's reviewed."""
         upload_id = str(uuid.uuid4())
         path = self._upload_path(upload_id)
         with open(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as f:
             f.write(self.cipher.encrypt_bytes(data))
         self._execute(
-            "INSERT INTO uploads (id, filename, status, uploaded_by, created_at) VALUES (?, ?, 'reading', ?, ?)",
-            (upload_id, self.cipher.encrypt(os.path.basename(filename)), actor, now()),
+            "INSERT INTO uploads (id, form_key, filename, status, uploaded_by, created_at) "
+            "VALUES (?, ?, ?, 'reading', ?, ?)",
+            (upload_id, form_key, self.cipher.encrypt(os.path.basename(filename)), actor, now()),
         )
-        self.log(actor, "upload.create", upload_id)
+        self.log(actor, "upload.create", upload_id, form_key)
         return upload_id
 
     def upload_image(self, upload_id: str) -> bytes:
@@ -252,6 +350,7 @@ class Database:
             return self.cipher.decrypt_bytes(f.read())
 
     def set_extraction(self, upload_id: str, extraction: dict | None, error: str | None = None) -> None:
+        """Store {"values": {...}, "uncertain": [...]} from the AI, or the error if reading failed."""
         status = "failed" if error else "ready"
         payload = self.cipher.encrypt(json.dumps(extraction)) if extraction is not None else None
         self._execute(
@@ -279,6 +378,7 @@ class Database:
         extraction = row["extraction"]
         return {
             "id": row["id"],
+            "form_key": row["form_key"],
             "filename": self.cipher.decrypt(row["filename"]),
             "status": row["status"],
             "extraction": json.loads(self.cipher.decrypt(extraction)) if extraction else None,
@@ -346,44 +446,59 @@ class Database:
     def record_login(self, user_id: int) -> None:
         self._execute("UPDATE users SET last_login = ? WHERE id = ?", (now(), user_id))
 
+
     # --- export -----------------------------------------------------------
 
-    def export_xlsx(self, path: str, records: list[dict] | None = None) -> int:
-        """Write records (default: all) to a formatted Excel workbook. Returns rows written.
+    def export_xlsx(self, path: str, form: FormTemplate, entries: list[dict] | None = None) -> int:
+        """Write entries (default: all of this form type) to a formatted workbook. Returns rows written.
 
         The workbook is NOT encrypted - it's for handing to people who need it.
         """
-        records = self.records() if records is None else records
+        entries = self.entries(form.key) if entries is None else entries
         wb = Workbook()
         ws = wb.active
-        ws.title = "Drug Tests"
-        ws.append(EXPORT_HEADERS)
-        for record in records:
-            row = [record[header] for header in EXPORT_HEADERS]
-            try:
-                row[FIELDS.index("TestDate")] = date.fromisoformat(record["TestDate"])
-            except (TypeError, ValueError):
-                pass
-            ws.append(row)
+        ws.title = form.name[:31]
+        ws.append([f.label for f in form.fields] + ["Source file", "Entered at", "Entered by"])
+        for entry in entries:
+            row = []
+            for field in form.fields:
+                value = entry["values"].get(field.key)
+                if value and field.type == "date":
+                    try:
+                        value = date.fromisoformat(value)
+                    except ValueError:
+                        pass
+                elif value and field.type == "number":
+                    try:
+                        value = float(value)
+                    except ValueError:
+                        pass
+                row.append(value)
+            ws.append(row + [entry["source_file"], entry["entered_at"], entry["entered_by"]])
 
         for cell in ws[1]:
             cell.font = Font(bold=True)
-        for index, width in enumerate(COLUMN_WIDTHS, start=1):
-            ws.column_dimensions[ws.cell(row=1, column=index).column_letter].width = width
-        for cell in ws["D"][1:]:
-            cell.number_format = "yyyy-mm-dd"
-        # Employee IDs stay text so leading zeros survive
-        for cell in ws["A"][1:]:
-            cell.number_format = "@"
+        widths = [COLUMN_WIDTH[f.type] for f in form.fields] + [24, 20, 14]
+        for index, width in enumerate(widths, start=1):
+            letter = ws.cell(row=1, column=index).column_letter
+            ws.column_dimensions[letter].width = width
+            field = form.fields[index - 1] if index <= len(form.fields) else None
+            for cell in ws[letter][1:]:
+                if field and field.type == "date":
+                    cell.number_format = "yyyy-mm-dd"
+                elif field and field.type == "id":
+                    cell.number_format = "@"  # keep leading zeros
         ws.freeze_panes = "A2"
-        last_col = ws.cell(row=1, column=len(EXPORT_HEADERS)).column_letter
-        last_row = max(len(records) + 1, 2)
+        last_col = ws.cell(row=1, column=len(widths)).column_letter
+        last_row = max(len(entries) + 1, 2)
         ws.auto_filter.ref = f"A1:{last_col}{last_row}"
-        result_col = ws.cell(row=1, column=FIELDS.index("Result") + 1).column_letter
-        for result, color in RESULT_FILLS.items():
-            ws.conditional_formatting.add(
-                f"A2:{last_col}{last_row}",
-                FormulaRule(formula=[f'${result_col}2="{result}"'], fill=PatternFill("solid", fgColor=color)),
-            )
+        if form.flag_field:
+            flag_col = ws.cell(row=1, column=form.keys.index(form.flag_field) + 1).column_letter
+            for value in form.flag_values:
+                quoted = value.replace('"', '""')
+                ws.conditional_formatting.add(
+                    f"A2:{last_col}{last_row}",
+                    FormulaRule(formula=[f'${flag_col}2="{quoted}"'], fill=PatternFill("solid", fgColor=FLAG_FILL)),
+                )
         atomic_write(path, wb.save)
-        return len(records)
+        return len(entries)

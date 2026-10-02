@@ -1,11 +1,27 @@
-# Drug Test Import
+# Form Import
 
-Turn photos of handwritten drug-test notes into clean, searchable records.
+Turn photos of handwritten or printed paper forms into clean, searchable records.
 
-1. Upload one or more photos of notes.
-2. Claude's vision model reads the handwriting and fills in the fields. Fields it found hard to read are flagged.
+1. Pick a form type and upload one or more photos.
+2. Claude's vision model reads each form and fills in that form type's fields. Fields it found hard to read are flagged.
 3. A reviewer checks each field against the photo, fixes anything wrong, and saves or skips. Nothing is stored until a person confirms.
 4. Search, filter and export records to a formatted Excel workbook.
+
+## Form types
+
+Built in: **Drug test**, **Safety incident**, **Training sign-off** and **Equipment inspection**. Admins can edit these or create their own under **Form types** in the web app, with no code changes. A form type has:
+
+- **Fields**, each with:
+  - a label;
+  - a type: short text, long text, ID/code, date, number, or a choice from a list;
+  - optional choices, a hint, and whether the field is required.
+- **Duplicate check fields:** if every ticked field matches an existing record, the reviewer is warned before saving.
+- **A date field** used to sort and filter records.
+- **A highlight rule**, e.g. flag Drug test records whose Result is Positive or Pending.
+
+The AI prompt and answer format, the review screen, validation, the records table and the Excel export all follow the form type.
+
+Once a form type has records, its existing fields can't be removed or change type, so stored data always matches a field. Labels, choices, hints and flags can still change, and new fields can be added.
 
 There are two ways to run it, sharing the same database format:
 
@@ -38,7 +54,7 @@ Roles:
 |---|---|
 | viewer | Search and view records |
 | reviewer | + upload photos, review/save records, export to Excel |
-| admin | + add/disable users, change roles, reset passwords, view the audit log |
+| admin | + manage form types and users, view the audit log |
 
 ### Desktop app
 
@@ -46,14 +62,19 @@ Roles:
 python -m drugtest_import.app
 ```
 
-Requires Tk (included with the python.org installers). Records from the old `DrugTestingOrganizer.csv` are imported automatically on first run.
+Requires Tk (included with the python.org installers). Choose the form type in the toolbar before opening images. Records from the old `DrugTestingOrganizer.csv` are imported as drug tests on first run.
 
 ### Other admin commands
 
 ```
 python -m drugtest_import.manage set-password maria
-python -m drugtest_import.manage import-csv old-records.csv
+python -m drugtest_import.manage list-forms
+python -m drugtest_import.manage import-csv old-records.csv --form drug-test
 ```
+
+CSV headers can be the field labels (e.g. `Inspection date`) or keys (e.g. `inspection_date`). Rows that fail validation are skipped and counted.
+
+Databases created by earlier versions (drug tests only) are upgraded automatically the first time they're opened.
 
 ## Configuration
 
@@ -70,7 +91,7 @@ python -m drugtest_import.manage import-csv old-records.csv
 
 ## Security
 
-- **Encryption at rest:** names, employee IDs, results, notes and photo file names are encrypted in the database (Fernet: AES-128-CBC + HMAC-SHA256). Uploaded photos are stored encrypted and deleted once saved or skipped. Exact-match lookups use keyed hashes, so duplicates can be found without decrypting.
+- **Encryption at rest:** every field value and photo file name is encrypted in the database (Fernet: AES-128-CBC + HMAC-SHA256); only each record's sort date is stored in plain text. Uploaded photos are stored encrypted and deleted once saved or skipped. Exact-match lookups use keyed hashes, so duplicates can be found without decrypting.
 - **Sign-in:** passwords are hashed with scrypt and must be at least 12 characters. An account locks for 15 minutes after 5 failed attempts. Sessions end after 30 minutes idle or 8 hours total.
 - **Web hardening:** CSRF tokens on every form, `SameSite=Strict` secure cookies, a strict Content-Security-Policy with no JavaScript, and `no-store` caching.
 - **Audit log:** sign-ins (including failures), uploads, saves, skips, record views, exports and user changes are logged with who and when. The log is append-only in the database.

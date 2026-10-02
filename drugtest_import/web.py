@@ -18,12 +18,13 @@ from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from PIL import Image, UnidentifiedImageError
+from pydantic import ValidationError
 from starlette.middleware.sessions import SessionMiddleware
 
 from .crypto import Cipher, hash_password, verify_password
 from .extract import ExtractionError, extract_fields
-from .schema import FIELDS, RESULTS, TEST_TYPES, normalize, validate
-from .storage import ROLES, Database
+from .forms import FIELD_TYPES, FieldDef, FormTemplate, make_key, normalize, validate
+from .storage import ROLES, Database, FormInUse
 
 log = logging.getLogger(__name__)
 HERE = os.path.dirname(__file__)
@@ -36,7 +37,6 @@ MAX_FILES_PER_UPLOAD = 50
 LOGIN_ATTEMPTS = 5
 LOGIN_WINDOW = 15 * 60
 IMAGE_TYPES = {"JPEG": "image/jpeg", "PNG": "image/png", "WEBP": "image/webp"}
-LABELS = {"EmployeeID": "Employee ID", "TestDate": "Test date", "TestType": "Test type"}
 # Compared against when a username doesn't exist, so response time doesn't reveal valid usernames
 DUMMY_HASH = hash_password("timing-equaliser")
 
@@ -148,9 +148,13 @@ def create_app(db: Database | None = None, extractor=extract_fields, workers: in
 
     def run_extraction(upload_id: str) -> None:
         try:
+            upload = db.get_upload(upload_id)
+            form = db.get_form(upload["form_key"]) if upload else None
+            if not form:
+                return  # skipped or form type deleted while queued
             image = db.upload_image(upload_id)
-            result = extractor(io.BytesIO(image))
-            db.set_extraction(upload_id, result.model_dump())
+            values, uncertain = extractor(io.BytesIO(image), form)
+            db.set_extraction(upload_id, {"values": values, "uncertain": uncertain})
         except (ExtractionError, OSError) as e:
             db.set_extraction(upload_id, None, str(e))
         except Exception:
@@ -161,6 +165,12 @@ def create_app(db: Database | None = None, extractor=extract_fields, workers: in
     for upload in db.pending_uploads():
         if upload["status"] == "reading":
             pool.submit(run_extraction, upload["id"])
+
+    def get_form_or_400(key: str) -> FormTemplate:
+        form = db.get_form(key)
+        if not form:
+            raise BadRequest("Unknown form type.")
+        return form
 
     # --- sign in ----------------------------------------------------------
 
@@ -209,26 +219,31 @@ def create_app(db: Database | None = None, extractor=extract_fields, workers: in
     @app.get("/review", response_class=HTMLResponse)
     def review_index(request: Request, user: dict = Depends(reviewer)):
         uploads = db.pending_uploads()
+        names = {f.key: f.name for f in db.forms()}
         return render(request, "review_index.html", {
             "uploads": uploads, "reading": any(u["status"] == "reading" for u in uploads),
+            "forms": db.forms(), "form_names": names, "selected": request.session.get("last_form"),
             "max_files": MAX_FILES_PER_UPLOAD, "max_mb": MAX_UPLOAD_BYTES // (1024 * 1024),
         })
 
     @app.post("/uploads")
-    async def upload(request: Request, files: list[UploadFile] = File(...), user: dict = Depends(reviewer)):
+    async def upload(request: Request, files: list[UploadFile] = File(...), form_key: str = Form(""),
+                     user: dict = Depends(reviewer)):
         await check_csrf(request)
+        form = get_form_or_400(form_key)
         files = [f for f in files if f.filename]
         if not files:
             raise BadRequest("Choose at least one photo.")
         if len(files) > MAX_FILES_PER_UPLOAD:
             raise BadRequest(f"Upload at most {MAX_FILES_PER_UPLOAD} photos at a time.")
+        request.session["last_form"] = form.key
         accepted, rejected = [], []
         for f in files:
             data = await f.read(MAX_UPLOAD_BYTES + 1)
             if len(data) > MAX_UPLOAD_BYTES or not image_format(data):
                 rejected.append(f.filename)
                 continue
-            accepted.append(db.create_upload(f.filename, data, user["username"]))
+            accepted.append(db.create_upload(f.filename, data, form.key, user["username"]))
         for upload_id in accepted:
             pool.submit(run_extraction, upload_id)
         if rejected:
@@ -256,21 +271,19 @@ def create_app(db: Database | None = None, extractor=extract_fields, workers: in
             raise Redirect("/review/next")
         return upload
 
-    def review_context(upload: dict, values: dict | None = None, **extra) -> dict:
+    def review_context(upload: dict, form: FormTemplate, values: dict | None = None, **extra) -> dict:
         extraction = upload["extraction"] or {}
         if values is None:
-            values = normalize(extraction) if extraction else {key: None for key in FIELDS}
+            values = normalize(form, extraction.get("values", {}))
         uploads = db.pending_uploads()
         position = next((i for i, u in enumerate(uploads) if u["id"] == upload["id"]), 0)
-        return {"upload": upload, "values": values, "fields": FIELDS, "labels": LABELS,
-                "choices": {"TestType": TEST_TYPES, "Result": RESULTS},
-                "uncertain": set(extraction.get("uncertain_fields", [])),
+        return {"upload": upload, "form": form, "values": values, "uncertain": set(extraction.get("uncertain", [])),
                 "position": position + 1, "total": len(uploads), "problems": {}, **extra}
 
     @app.get("/review/{upload_id}", response_class=HTMLResponse)
     def review(request: Request, upload_id: str, user: dict = Depends(reviewer)):
         upload = get_upload_or_404(upload_id)
-        return render(request, "review.html", review_context(upload))
+        return render(request, "review.html", review_context(upload, get_form_or_400(upload["form_key"])))
 
     @app.get("/uploads/{upload_id}/image")
     def upload_image(upload_id: str, user: dict = Depends(reviewer)):
@@ -284,70 +297,85 @@ def create_app(db: Database | None = None, extractor=extract_fields, workers: in
     @app.post("/review/{upload_id}")
     async def review_submit(request: Request, upload_id: str, user: dict = Depends(reviewer)):
         await check_csrf(request)
-        form = await request.form()
+        submitted = await request.form()
         upload = get_upload_or_404(upload_id)
-        if form.get("action") == "skip":
+        if submitted.get("action") == "skip":
             db.delete_upload(upload_id)
             db.log(user["username"], "upload.skip", upload_id)
             return RedirectResponse("/review/next", status_code=303)
 
-        record = normalize({key: form.get(key) for key in FIELDS})
-        context = review_context(upload, values=record)
-        problems = validate(record)
+        form = get_form_or_400(upload["form_key"])
+        values = normalize(form, {key: submitted.get(f"field_{key}") for key in form.keys})
+        context = review_context(upload, form, values=values)
+        problems = validate(form, values)
         if problems:
             return render(request, "review.html", {**context, "problems": problems,
                           "error": "Fix the highlighted fields before saving."}, status_code=422)
-        if context["uncertain"] and not form.get("confirm_uncertain"):
+        if context["uncertain"] and not submitted.get("confirm_uncertain"):
             return render(request, "review.html", {**context, "error":
                           "Tick the box to confirm you checked the hard-to-read fields against the photo."},
                           status_code=422)
-        duplicate = db.find_duplicate(record)
-        if duplicate and not form.get("confirm_duplicate"):
+        duplicate = db.find_duplicate(form, values)
+        if duplicate and not submitted.get("confirm_duplicate"):
             return render(request, "review.html", {**context, "duplicate": duplicate}, status_code=409)
-        db.add_record(record, user["username"], source_file=upload["filename"])
+        db.add_entry(form, values, user["username"], source_file=upload["filename"])
         db.delete_upload(upload_id)
         return RedirectResponse("/review/next", status_code=303)
 
     # --- records ----------------------------------------------------------
 
-    def filtered_records(q: str, result: str, start: str, end: str) -> list[dict]:
-        records = db.records()
+    def filtered_entries(form: FormTemplate, q: str, flag: str, start: str, end: str) -> list[dict]:
+        entries = db.entries(form.key)
         q = q.strip().lower()
         if q:
-            records = [r for r in records if q in (r["Name"] or "").lower() or q in (r["EmployeeID"] or "").lower()]
-        if result:
-            records = [r for r in records if r["Result"] == result]
-        if start:
-            records = [r for r in records if r["TestDate"] >= start]
-        if end:
-            records = [r for r in records if r["TestDate"] <= end]
-        return records
+            entries = [e for e in entries if any(q in str(v).lower() for v in e["values"].values() if v)]
+        if flag and form.flag_field:
+            if flag == "*flagged":
+                entries = [e for e in entries if e["values"].get(form.flag_field) in form.flag_values]
+            else:
+                entries = [e for e in entries if e["values"].get(form.flag_field) == flag]
+        if form.date_field:
+            if start:
+                entries = [e for e in entries if (e["values"].get(form.date_field) or "") >= start]
+            if end:
+                entries = [e for e in entries if (e["values"].get(form.date_field) or "9999") <= end]
+        return entries
 
-    def filter_summary(q, result, start, end) -> str | None:
-        parts = [f"{k}={v}" for k, v in (("q", q), ("result", result), ("from", start), ("to", end)) if v]
-        return ", ".join(parts) or None
+    def filter_summary(form, q, flag, start, end) -> str:
+        parts = [f"{k}={v}" for k, v in (("q", q), ("flag", flag), ("from", start), ("to", end)) if v]
+        return "; ".join([form.key] + parts)
+
+    def records_form(form_key: str) -> FormTemplate:
+        forms = db.forms()
+        if not form_key:
+            return forms[0]
+        return get_form_or_400(form_key)
 
     @app.get("/records", response_class=HTMLResponse)
-    def records(request: Request, q: str = "", result: str = "", start: str = "", end: str = "",
+    def records(request: Request, form: str = "", q: str = "", flag: str = "", start: str = "", end: str = "",
                 user: dict = Depends(viewer)):
-        rows = filtered_records(q, result, start, end)
-        db.log(user["username"], "records.view", detail=filter_summary(q, result, start, end))
+        selected = records_form(form)
+        rows = filtered_entries(selected, q, flag, start, end)
+        db.log(user["username"], "records.view", detail=filter_summary(selected, q, flag, start, end))
         return render(request, "records.html", {
-            "records": rows, "fields": FIELDS, "labels": LABELS, "results": RESULTS,
-            "filters": {"q": q, "result": result, "start": start, "end": end},
+            "form": selected, "forms": db.forms(), "entries": rows,
+            "filters": {"form": selected.key, "q": q, "flag": flag, "start": start, "end": end},
         })
 
     @app.get("/records/export.xlsx")
-    def export(q: str = "", result: str = "", start: str = "", end: str = "", user: dict = Depends(reviewer)):
-        rows = filtered_records(q, result, start, end)
+    def export(form: str = "", q: str = "", flag: str = "", start: str = "", end: str = "",
+               user: dict = Depends(reviewer)):
+        selected = records_form(form)
+        rows = filtered_entries(selected, q, flag, start, end)
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "export.xlsx")
-            db.export_xlsx(path, rows)
+            db.export_xlsx(path, selected, rows)
             with open(path, "rb") as f:
                 data = f.read()
-        db.log(user["username"], "records.export", detail=f"{len(rows)} rows; {filter_summary(q, result, start, end) or 'all'}")
+        db.log(user["username"], "records.export", detail=f"{len(rows)} rows; {filter_summary(selected, q, flag, start, end)}")
+        filename = f"{selected.name.replace(' ', '')}-{date.today()}.xlsx"
         return Response(data, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        headers={"Content-Disposition": f'attachment; filename="DrugTests-{date.today()}.xlsx"'})
+                        headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
     # --- admin ------------------------------------------------------------
 
@@ -393,11 +421,129 @@ def create_app(db: Database | None = None, extractor=extract_fields, workers: in
                           status_code=422)
         return RedirectResponse("/admin/users", status_code=303)
 
+    # --- admin: form types --------------------------------------------------
+
+    def forms_page(request: Request, error: str | None = None, status_code: int = 200):
+        counts = {f.key: db.count(f.key) for f in db.forms()}
+        return render(request, "forms.html", {"forms": db.forms(), "counts": counts, "error": error},
+                      status_code=status_code)
+
+    def form_editor(request: Request, form: FormTemplate, error: str | None = None, status_code: int = 200):
+        return render(request, "form_edit.html", {
+            "form": form, "types": FIELD_TYPES, "locked": set(form.keys) if db.count(form.key) else set(),
+            "entry_count": db.count(form.key), "error": error,
+        }, status_code=status_code)
+
+    @app.get("/admin/forms", response_class=HTMLResponse)
+    def list_forms(request: Request, user: dict = Depends(admin)):
+        return forms_page(request)
+
+    @app.post("/admin/forms")
+    async def create_form(request: Request, name: str = Form(""), copy_from: str = Form(""),
+                          user: dict = Depends(admin)):
+        await check_csrf(request)
+        name = name.strip()
+        if not name:
+            return forms_page(request, "Give the form type a name.", 422)
+        taken = {f.key for f in db.forms()}
+        key = make_key(name, taken).replace("_", "-")
+        source = db.get_form(copy_from) if copy_from else None
+        try:
+            form = FormTemplate(
+                key=key, name=name, description=source.description if source else "",
+                fields=source.fields if source else [FieldDef(key="name", label="Name", required=True)],
+                date_field=source.date_field if source else None,
+                flag_field=source.flag_field if source else None,
+                flag_values=source.flag_values if source else [],
+            )
+        except ValidationError as e:
+            return forms_page(request, friendly(e), 422)
+        db.save_form(form, user["username"])
+        return RedirectResponse(f"/admin/forms/{key}", status_code=303)
+
+    @app.get("/admin/forms/{key}", response_class=HTMLResponse)
+    def edit_form(request: Request, key: str, user: dict = Depends(admin)):
+        return form_editor(request, get_form_or_400(key))
+
+    @app.post("/admin/forms/{key}")
+    async def save_form(request: Request, key: str, user: dict = Depends(admin)):
+        await check_csrf(request)
+        existing = get_form_or_400(key)
+        submitted = await request.form()
+        rows = []
+        for i in range(int(submitted.get("field_count", 0)) + 1):  # +1: the blank "add field" row
+            label = (submitted.get(f"f{i}_label") or "").strip()
+            if not label or submitted.get(f"f{i}_remove"):
+                continue
+            rows.append((submitted.get(f"f{i}_order") or str(i + 1), i, {
+                "key": submitted.get(f"f{i}_key") or None,
+                "label": label,
+                "type": submitted.get(f"f{i}_type") or "text",
+                "required": bool(submitted.get(f"f{i}_required")),
+                "duplicate_check": bool(submitted.get(f"f{i}_duplicate")),
+                "choices": (submitted.get(f"f{i}_choices") or "").split(","),
+                "hint": (submitted.get(f"f{i}_hint") or "").strip(),
+            }))
+
+        def order(row):
+            try:
+                return (float(row[0]), row[1])
+            except ValueError:
+                return (float(row[1] + 1), row[1])
+
+        fields, taken = [], set()
+        for _, _, field in sorted(rows, key=order):
+            if field["key"] not in existing.keys:  # new field: derive a key from its label
+                field["key"] = make_key(field["label"], taken | set(existing.keys))
+            taken.add(field["key"])
+            fields.append(field)
+        try:
+            form = FormTemplate(
+                key=existing.key,
+                name=(submitted.get("name") or "").strip(),
+                description=(submitted.get("description") or "").strip(),
+                fields=fields,
+                date_field=submitted.get("date_field") or None,
+                flag_field=submitted.get("flag_field") or None,
+                flag_values=(submitted.get("flag_values") or "").split(","),
+            )
+            db.save_form(form, user["username"])
+        except ValidationError as e:
+            return form_editor(request, existing, friendly(e), 422)
+        except FormInUse as e:
+            return form_editor(request, existing, str(e), 422)
+        return RedirectResponse(f"/admin/forms/{key}?saved=1", status_code=303)
+
+    @app.post("/admin/forms/{key}/delete")
+    async def delete_form(request: Request, key: str, user: dict = Depends(admin)):
+        await check_csrf(request)
+        get_form_or_400(key)
+        try:
+            db.delete_form(key, user["username"])
+        except FormInUse as e:
+            return forms_page(request, str(e), 422)
+        return RedirectResponse("/admin/forms", status_code=303)
+
     @app.get("/admin/audit", response_class=HTMLResponse)
     def audit(request: Request, user: dict = Depends(admin)):
         return render(request, "audit.html", {"entries": db.audit_entries()})
 
     return app
+
+
+def friendly(error: ValidationError) -> str:
+    """Turn a pydantic error into a short message for the form editor."""
+    messages = []
+    for item in error.errors():
+        message = item["msg"].removeprefix("Value error, ")
+        if item["type"] == "string_pattern_mismatch":
+            message = "Labels must contain at least one letter"
+        elif item["type"] == "too_short" and item["loc"] and item["loc"][0] == "fields":
+            message = "A form type needs at least one field"
+        elif item["type"] == "string_too_short" and item["loc"] and item["loc"][0] == "name":
+            message = "Give the form type a name"
+        messages.append(message)
+    return "; ".join(dict.fromkeys(messages))
 
 
 def image_format(data: bytes) -> str | None:

@@ -10,7 +10,6 @@ from PIL import Image
 from drugtest_import import web
 from drugtest_import.crypto import Cipher, generate_key
 from drugtest_import.extract import ExtractionError
-from drugtest_import.schema import Extraction
 from drugtest_import.storage import Database
 
 PASSWORD = "a-long-test-password"
@@ -22,12 +21,14 @@ def png(color="yellow") -> bytes:
     return buffer.getvalue()
 
 
-def fake_extractor(image):
+def fake_extractor(image, form):
     color = Image.open(image).getpixel((0, 0))
     if color == (255, 0, 0):
         raise ExtractionError("blurry")
-    return Extraction(EmployeeID="emp005", Name="Bob Wilson", TestDate="9/18/2025", TestType="urine",
-                      Result="Negative", uncertain_fields=["Result"])
+    if form.key == "equipment-inspection":
+        return {"equipment_id": "fl-3", "inspection_date": "3/1/2025", "inspector": "Ana", "status": "needs repair"}, []
+    return {"employee_id": "emp005", "name": "Bob Wilson", "test_date": "9/18/2025", "test_type": "urine",
+            "result": "Negative"}, ["result"]
 
 
 @pytest.fixture
@@ -127,7 +128,7 @@ def test_upload_review_save_export(app, db):
     token = csrf(client, "/review")
     files = [("files", ("note1.png", png(), "image/png")), ("files", ("bad.png", png("red"), "image/png")),
              ("files", ("notes.txt", b"not an image", "text/plain"))]
-    response = client.post("/uploads", data={"csrf": token}, files=files)
+    response = client.post("/uploads", data={"csrf": token, "form_key": "drug-test"}, files=files)
     assert response.status_code == 200 and "notes.txt" in response.text  # partial success page
     wait_until_read(db)
     first, second = db.pending_uploads()
@@ -138,9 +139,9 @@ def test_upload_review_save_export(app, db):
     image = client.get(f"/uploads/{first['id']}/image")
     assert image.headers["content-type"] == "image/png" and image.content == png()
 
-    form = {"csrf": token, "action": "save", "EmployeeID": "EMP005", "Name": "Bob Wilson",
-            "TestDate": "2025-09-18", "TestType": "Urine", "Result": "Negative", "Notes": ""}
-    assert client.post(f"/review/{first['id']}", data={**form, "Result": "Negatve"}).status_code == 422
+    form = {"csrf": token, "action": "save", "field_employee_id": "EMP005", "field_name": "Bob Wilson",
+            "field_test_date": "2025-09-18", "field_test_type": "Urine", "field_result": "Negative", "field_notes": ""}
+    assert client.post(f"/review/{first['id']}", data={**form, "field_result": "Negatve"}).status_code == 422
     response = client.post(f"/review/{first['id']}", data=form)
     assert response.status_code == 422 and "Tick the box" in response.text
     response = client.post(f"/review/{first['id']}", data={**form, "confirm_uncertain": "1"}, follow_redirects=False)
@@ -153,16 +154,19 @@ def test_upload_review_save_export(app, db):
     client.post(f"/review/{second['id']}", data={**form, "action": "skip"})
     assert db.pending_uploads() == [] and db.count() == 1
 
-    records = client.get("/records?q=bob").text
+    records = client.get("/records?form=drug-test&q=bob").text
     assert "Bob Wilson" in records and "reviewer" in records
-    assert "Bob Wilson" not in client.get("/records?result=Positive").text
+    assert "Bob Wilson" not in client.get("/records?form=drug-test&flag=Positive").text
+    assert "Bob Wilson" not in client.get("/records?form=drug-test&flag=*flagged").text
+    assert "Bob Wilson" not in client.get("/records?form=drug-test&start=2025-09-19").text
 
-    export = client.get("/records/export.xlsx")
+    export = client.get("/records/export.xlsx?form=drug-test")
     ws = load_workbook(io.BytesIO(export.content)).active
     assert ws["B2"].value == "Bob Wilson" and ws["J2"].value == "reviewer"
+    assert export.headers["content-disposition"].startswith('attachment; filename="Drugtest-')
 
     actions = [e["action"] for e in db.audit_entries()]
-    for action in ("upload.create", "record.create", "upload.skip", "records.view", "records.export"):
+    for action in ("upload.create", "entry.create", "upload.skip", "records.view", "records.export"):
         assert action in actions
 
 
@@ -182,3 +186,73 @@ def test_admin_user_management(app, db):
     assert db.get_user(nurse_id)["active"] == 0
     assert "user.disable" in [e["action"] for e in db.audit_entries()]
     assert "user.disable" in client.get("/admin/audit").text
+
+
+def test_other_form_type_end_to_end(app, db):
+    client = login(app, "reviewer")
+    token = csrf(client, "/review")
+    assert "Equipment inspection" in client.get("/review").text
+    client.post("/uploads", data={"csrf": token, "form_key": "equipment-inspection"},
+                files=[("files", ("check.png", png(), "image/png"))])
+    wait_until_read(db)
+    [upload] = db.pending_uploads()
+    page = client.get(f"/review/{upload['id']}").text
+    assert 'name="field_equipment_id" value="FL-3"' in page and "Needs repair" in page
+    form = {"csrf": token, "action": "save", "field_equipment_id": "FL-3", "field_inspection_date": "2025-03-01",
+            "field_inspector": "Ana", "field_status": "Needs repair"}
+    assert client.post(f"/review/{upload['id']}", data=form, follow_redirects=False).status_code == 303
+    page = client.get("/records?form=equipment-inspection&flag=*flagged").text
+    assert "FL-3" in page and 'class="flagged"' in page
+    assert db.count("drug-test") == 0
+
+
+def test_upload_rejects_unknown_form(app):
+    client = login(app, "reviewer")
+    token = csrf(client, "/review")
+    response = client.post("/uploads", data={"csrf": token, "form_key": "nope"},
+                           files=[("files", ("a.png", png(), "image/png"))])
+    assert response.status_code == 400
+
+
+def test_admin_form_editor(app, db):
+    client = login(app, "admin")
+    token = csrf(client, "/admin/forms")
+    assert login(app, "reviewer").get("/admin/forms").status_code == 403
+
+    response = client.post("/admin/forms", data={"csrf": token, "name": "Vehicle check", "copy_from": ""},
+                           follow_redirects=False)
+    assert response.headers["location"] == "/admin/forms/vehicle-check"
+    assert db.get_form("vehicle-check").keys == ["name"]
+
+    edit = {"csrf": token, "name": "Vehicle check", "description": "Daily pre-use check", "field_count": "1",
+            "f0_key": "name", "f0_label": "Driver", "f0_type": "text", "f0_order": "2", "f0_required": "1",
+            "f1_label": "Check date", "f1_type": "date", "f1_order": "1", "f1_duplicate": "1",
+            "date_field": "", "flag_field": "", "flag_values": ""}
+    assert client.post("/admin/forms/vehicle-check", data=edit, follow_redirects=False).status_code == 303
+    form = db.get_form("vehicle-check")
+    assert [(f.key, f.label) for f in form.fields] == [("check_date", "Check date"), ("name", "Driver")]
+    assert form.duplicate_keys == ["check_date"] and form.description == "Daily pre-use check"
+
+    edit.update({"field_count": "2", "f0_key": "check_date", "f0_label": "Check date", "f0_type": "date",
+                 "f1_key": "name", "f1_label": "Driver", "f1_type": "text",
+                 "f2_label": "Result", "f2_type": "choice", "f2_choices": "OK, Fault",
+                 "date_field": "check_date", "flag_field": "result", "flag_values": "fault"})
+    client.post("/admin/forms/vehicle-check", data=edit)
+    form = db.get_form("vehicle-check")
+    assert form.field("result").choices == ["OK", "Fault"] and form.flag_values == ["Fault"]
+
+    bad = {**edit, "f3_label": "Broken", "f3_type": "choice", "f3_choices": ""}
+    edit["field_count"] = "3"
+    response = client.post("/admin/forms/vehicle-check", data={**bad, "field_count": "3"})
+    assert response.status_code == 422 and "needs at least one choice" in response.text
+
+    db.add_entry(form, {"check_date": "2025-01-01", "name": "Al", "result": "OK"}, "test")
+    response = client.post("/admin/forms/vehicle-check", data={**edit, "f2_remove": "1"})
+    assert response.status_code == 422 and "can't be removed" in response.text
+    response = client.post("/admin/forms/vehicle-check/delete", data={"csrf": token})
+    assert response.status_code == 422 and db.get_form("vehicle-check")
+
+    client.post("/admin/forms/training-signoff/delete", data={"csrf": token})
+    assert db.get_form("training-signoff") is None
+    actions = [e["action"] for e in db.audit_entries()]
+    assert {"form.create", "form.update", "form.delete"} <= set(actions)

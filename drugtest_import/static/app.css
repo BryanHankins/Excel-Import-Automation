@@ -1,13 +1,13 @@
 :root {
   --bg: #f7f7f5; --surface: #fff; --text: #1c1c1a; --muted: #6b6b66; --border: #dcdcd6;
   --accent: #1d4ed8; --accent-text: #fff; --warn: #b45309; --warn-bg: #fef3c7;
-  --error: #b91c1c; --error-bg: #fee2e2; --positive-bg: #fee2e2; --pending-bg: #fef9c3;
+  --error: #b91c1c; --error-bg: #fee2e2; --ok-bg: #dcfce7; --positive-bg: #fee2e2; --pending-bg: #fef9c3;
 }
 @media (prefers-color-scheme: dark) {
   :root {
     --bg: #161615; --surface: #20201e; --text: #ececea; --muted: #a3a39d; --border: #3a3a36;
     --accent: #60a5fa; --accent-text: #0b1220; --warn: #fbbf24; --warn-bg: #3b2f12;
-    --error: #f87171; --error-bg: #3f1d1d; --positive-bg: #3f1d1d; --pending-bg: #3a3415;
+    --error: #f87171; --error-bg: #3f1d1d; --ok-bg: #14321f; --positive-bg: #3f1d1d; --pending-bg: #3a3415;
   }
 }
 * { box-sizing: border-box; }
@@ -51,8 +51,19 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 table { width: 100%; border-collapse: collapse; background: var(--surface); }
 th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
 th { font-weight: 600; white-space: nowrap; }
-tr.result-positive td { background: var(--positive-bg); }
-tr.result-pending td, tr.result-inconclusive td, tr.result-refused td { background: var(--pending-bg); }
 .tag { padding: 2px 8px; border-radius: 999px; font-size: 0.85em; background: var(--bg); border: 1px solid var(--border); }
 .tag.failed { background: var(--error-bg); }
 .tag.reading { background: var(--warn-bg); }
+textarea { font: inherit; padding: 6px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); color: var(--text); width: 100%; margin-top: 2px; display: block; }
+.uncertain textarea { border-color: var(--warn); background: var(--warn-bg); }
+.invalid textarea { border-color: var(--error); }
+.alert.ok { background: var(--ok-bg); }
+.tabs { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 12px; border-bottom: 1px solid var(--border); }
+.tabs a { padding: 6px 12px; text-decoration: none; color: var(--muted); border-bottom: 2px solid transparent; }
+.tabs a.active { color: var(--text); border-bottom-color: var(--accent); font-weight: 600; }
+tr.flagged td { background: var(--positive-bg); }
+table.fields input:not([type=checkbox]), table.fields select { width: 100%; min-width: 90px; }
+table.fields input[size] { width: 3.5em; min-width: 0; }
+td.center { text-align: center; }
+tr.new td { background: var(--bg); }
+table.fields td:nth-child(2) input { min-width: 160px; }
