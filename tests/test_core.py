@@ -1,12 +1,12 @@
-import csv
 from datetime import date
 from types import SimpleNamespace
 
 import pytest
+from openpyxl import load_workbook
 
 from drugtest_import import extract
 from drugtest_import.schema import Extraction, normalize, normalize_date, validate
-from drugtest_import.storage import append_record
+from drugtest_import.storage import RecordStore
 
 GOOD = {"EmployeeID": "emp005", "Name": " Bob Wilson ", "Department": "Sales", "TestDate": "9/18/2025",
         "TestType": "urine", "Result": "NEGATIVE", "Notes": "Pre-employment screen"}
@@ -37,14 +37,53 @@ def test_validate_rejects_future_date():
     assert "TestDate" in validate(normalize(GOOD), today=date(2025, 9, 1))
 
 
-def test_append_record_keeps_leading_zeros(tmp_path):
-    path = tmp_path / "log.csv"
-    append_record(normalize({**GOOD, "EmployeeID": "007123"}), str(path))
-    append_record(normalize(GOOD), str(path))
-    with open(path, newline="") as f:
-        rows = list(csv.DictReader(f))
-    assert [r["EmployeeID"] for r in rows] == ["007123", "EMP005"]
-    assert list(rows[0]) == ["EmployeeID", "Name", "Department", "TestDate", "TestType", "Result", "Notes"]
+@pytest.fixture
+def store(tmp_path):
+    store = RecordStore(str(tmp_path / "records.db"))
+    yield store
+    store.close()
+
+
+def test_store_round_trip_keeps_text_ids(store):
+    store.add(normalize({**GOOD, "EmployeeID": "007123"}), source_file="/private/photos/note1.jpg")
+    [record] = store.all()
+    assert record["EmployeeID"] == "007123"
+    assert record["SourceFile"] == "note1.jpg"  # full path not stored
+    assert store.count() == 1
+
+
+def test_find_duplicate(store):
+    record = normalize(GOOD)
+    assert store.find_duplicate(record) is None
+    store.add(record)
+    assert store.find_duplicate({**record, "Name": "bob wilson", "EmployeeID": None})["Name"] == "Bob Wilson"
+    assert store.find_duplicate({**record, "EmployeeID": "EMP999"}) is None
+    assert store.find_duplicate({**record, "TestType": "Hair"}) is None
+
+
+def test_import_legacy_csv_skips_invalid_rows(store, tmp_path):
+    path = tmp_path / "old.csv"
+    path.write_text(
+        "EmployeeID,Name,Department,TestDate,TestType,Result,Notes\n"
+        ",John Doe,HR,9/15/2025,urine,negative,ok\n"
+        "EMP9,,IT,2025-09-15,Blood,Pending,missing name\n"
+    )
+    assert store.import_csv(str(path)) == (1, 1)
+    [record] = store.all()
+    assert (record["Name"], record["TestDate"], record["TestType"]) == ("John Doe", "2025-09-15", "Urine")
+
+
+def test_export_xlsx(store, tmp_path):
+    store.add(normalize({**GOOD, "EmployeeID": "007123"}))
+    store.add(normalize({**GOOD, "Name": "Ann Lee", "Result": "Positive"}))
+    path = tmp_path / "out.xlsx"
+    assert store.export_xlsx(str(path)) == 2
+    ws = load_workbook(path).active
+    assert [c.value for c in ws[1]][:7] == ["EmployeeID", "Name", "Department", "TestDate", "TestType", "Result", "Notes"]
+    assert ws["A2"].value == "007123"
+    assert ws["D2"].value.date() == date(2025, 9, 18)
+    assert ws["F3"].value == "Positive"
+    assert ws.freeze_panes == "A2"
 
 
 class FakeClient:

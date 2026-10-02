@@ -1,37 +1,47 @@
-"""Desktop app: pick a photo, let Claude read it, review/correct the fields, then save."""
+"""Desktop app: pick photos, let Claude read them, review/correct each one, then save."""
 import os
 import queue
-import threading
 import tkinter as tk
+from concurrent.futures import ThreadPoolExecutor
 from tkinter import filedialog, messagebox, ttk
 
 from PIL import Image, ImageOps, ImageTk
 
 from .extract import ExtractionError, extract_fields
 from .schema import FIELDS, RESULTS, TEST_TYPES, normalize, validate
-from .storage import append_record
+from .storage import RecordStore
 
-DATA_FILE = os.environ.get("DRUGTEST_CSV", "DrugTestingOrganizer.csv")
+DB_FILE = os.environ.get("DRUGTEST_DB", "drugtest.db")
+LEGACY_CSV = os.environ.get("DRUGTEST_CSV", "DrugTestingOrganizer.csv")
+PARALLEL_READS = 3
 PREVIEW_SIZE = (420, 520)
 CHOICES = {"TestType": TEST_TYPES, "Result": RESULTS}
 LABELS = {"EmployeeID": "Employee ID", "TestDate": "Test date (YYYY-MM-DD)", "TestType": "Test type"}
 
 
 class ReviewApp:
-    def __init__(self, root: tk.Tk):
+    def __init__(self, root: tk.Tk, store: RecordStore):
         self.root = root
+        self.store = store
         self.root.title("Drug Test Import")
-        self.image_path = None
+        self.pool = ThreadPoolExecutor(max_workers=PARALLEL_READS)
+        self.futures = []
+        self.results = queue.Queue()  # worker threads -> UI thread; Tk isn't thread-safe
+        self.outcomes = {}  # path -> (Extraction | None, error | None)
+        self.batch, self.index = [], 0
+        self.saved = self.skipped = 0
         self.uncertain = set()
         self.preview = None
-        self.results = queue.Queue()  # worker thread -> UI thread; Tk isn't thread-safe
 
         toolbar = ttk.Frame(root, padding=8)
         toolbar.pack(fill="x")
-        self.open_button = ttk.Button(toolbar, text="Open image…", command=self.open_image)
+        self.open_button = ttk.Button(toolbar, text="Open images…", command=self.open_images)
         self.open_button.pack(side="left")
-        self.status = ttk.Label(toolbar, text=f"Saving to {os.path.abspath(DATA_FILE)}")
-        self.status.pack(side="left", padx=12)
+        ttk.Button(toolbar, text="Export to Excel…", command=self.export).pack(side="left", padx=(8, 0))
+        self.progress = ttk.Label(toolbar, text="")
+        self.progress.pack(side="right")
+        self.status = ttk.Label(root, padding=(8, 0), text=f"{store.count()} records in {os.path.abspath(store.path)}")
+        self.status.pack(fill="x")
 
         body = ttk.Frame(root, padding=8)
         body.pack(fill="both", expand=True)
@@ -40,7 +50,7 @@ class ReviewApp:
 
         form = ttk.Frame(body)
         form.grid(row=0, column=1, sticky="n")
-        self.vars, self.hints = {}, {}
+        self.vars, self.hints, self.inputs = {}, {}, {}
         for row, key in enumerate(FIELDS):
             ttk.Label(form, text=LABELS.get(key, key)).grid(row=row * 2, column=0, sticky="w")
             var = tk.StringVar()
@@ -51,32 +61,39 @@ class ReviewApp:
             widget.grid(row=row * 2, column=1, sticky="w", pady=(4, 0))
             hint = ttk.Label(form, text="", foreground="#b45309")
             hint.grid(row=row * 2 + 1, column=1, sticky="w")
-            self.vars[key], self.hints[key] = var, hint
+            self.vars[key], self.hints[key], self.inputs[key] = var, hint, widget
 
         buttons = ttk.Frame(form)
         buttons.grid(row=len(FIELDS) * 2, column=0, columnspan=2, pady=12, sticky="e")
-        ttk.Button(buttons, text="Discard", command=self.clear).pack(side="right")
-        self.save_button = ttk.Button(buttons, text="Save record", command=self.save, state="disabled")
+        self.skip_button = ttk.Button(buttons, text="Skip", command=self.skip, state="disabled")
+        self.skip_button.pack(side="right")
+        self.save_button = ttk.Button(buttons, text="Save", command=self.save, state="disabled")
         self.save_button.pack(side="right", padx=8)
 
-    def open_image(self):
-        path = filedialog.askopenfilename(filetypes=[("Images", "*.jpg *.jpeg *.png *.webp")])
-        if not path:
+        self.root.protocol("WM_DELETE_WINDOW", self.close)
+        self.root.after(100, self._poll_results)
+
+    # --- batch handling -------------------------------------------------
+
+    @property
+    def current(self):
+        return self.batch[self.index] if self.index < len(self.batch) else None
+
+    def open_images(self):
+        paths = filedialog.askopenfilenames(filetypes=[("Images", "*.jpg *.jpeg *.png *.webp")])
+        if not paths:
             return
-        self.clear()
-        try:
-            with Image.open(path) as img:
-                img = ImageOps.exif_transpose(img)
-                img.thumbnail(PREVIEW_SIZE)
-                self.preview = ImageTk.PhotoImage(img)
-        except OSError as e:
-            messagebox.showerror("Can't open image", str(e))
+        remaining = len(self.batch) - self.index
+        if remaining and not messagebox.askyesno(
+            "Replace batch?", f"{remaining} image(s) in the current batch haven't been saved. Discard them?"
+        ):
             return
-        self.image_path = path
-        self.image_label.configure(image=self.preview, text="")
-        self.set_busy(True, "Reading handwriting…")
-        threading.Thread(target=self._extract, args=(path,), daemon=True).start()
-        self.root.after(100, self._poll_result, path)
+        for future in self.futures:
+            future.cancel()
+        self.batch, self.index, self.outcomes = list(dict.fromkeys(paths)), 0, {}
+        self.saved = self.skipped = 0
+        self.futures = [self.pool.submit(self._extract, path) for path in self.batch]
+        self.show_current()
 
     def _extract(self, path):
         try:
@@ -84,35 +101,79 @@ class ReviewApp:
         except (ExtractionError, OSError) as e:
             self.results.put((path, None, str(e)))
 
-    def _poll_result(self, path):
-        try:
-            done_path, result, error = self.results.get_nowait()
-        except queue.Empty:
-            self.root.after(100, self._poll_result, path)
-            return
-        if done_path != self.image_path:
-            return  # user discarded this image while it was being read
-        if error:
-            self._on_failed(error)
-        else:
-            self._on_extracted(result)
+    def _poll_results(self):
+        while True:
+            try:
+                path, result, error = self.results.get_nowait()
+            except queue.Empty:
+                break
+            if path not in self.batch:
+                continue  # left over from a batch the user replaced
+            self.outcomes[path] = (result, error)
+            if path == self.current:
+                self.show_outcome()
+        self.update_progress()
+        self.root.after(100, self._poll_results)
 
-    def _on_extracted(self, result):
+    def advance(self):
+        self.index += 1
+        if self.current:
+            self.show_current()
+            return
+        self.clear()
+        self.status.configure(
+            text=f"Batch done: {self.saved} saved, {self.skipped} skipped. {self.store.count()} records total."
+        )
+        self.batch, self.index = [], 0
+        self.update_progress()
+
+    def update_progress(self):
+        if not self.batch:
+            self.progress.configure(text="")
+            return
+        read = sum(1 for path in self.batch if path in self.outcomes)
+        self.progress.configure(text=f"Image {self.index + 1} of {len(self.batch)} · {read}/{len(self.batch)} read")
+
+    # --- current image ---------------------------------------------------
+
+    def show_current(self):
+        self.clear_form()
+        path = self.current
+        try:
+            with Image.open(path) as img:
+                img = ImageOps.exif_transpose(img)
+                img.thumbnail(PREVIEW_SIZE)
+                self.preview = ImageTk.PhotoImage(img)
+            self.image_label.configure(image=self.preview, text="")
+        except OSError:
+            self.preview = None
+            self.image_label.configure(image="", text=f"Can't display {os.path.basename(path)}")
+        self.skip_button.configure(state="normal")
+        if path in self.outcomes:
+            self.show_outcome()
+        else:
+            self.set_form_enabled(False)
+            self.status.configure(text=f"Reading {os.path.basename(path)}…")
+        self.update_progress()
+
+    def show_outcome(self):
+        result, error = self.outcomes[self.current]
+        self.set_form_enabled(True)
+        name = os.path.basename(self.current)
+        if error:
+            self.status.configure(text=f"Couldn't read {name}: {error} Enter the fields manually or skip.")
+            return
         record = normalize(result.model_dump())
         for key in FIELDS:
             self.vars[key].set(record[key] or "")
         self.uncertain = set(result.uncertain_fields)
-        self.set_busy(False, "Check every field against the photo, then save.")
+        self.status.configure(text=f"{name}: check every field against the photo, then save.")
         self.show_hints()
 
-    def _on_failed(self, message):
-        self.set_busy(False, "Could not read the image. Enter the fields manually.")
-        messagebox.showerror("Extraction failed", message)
-
-    def set_busy(self, busy, message):
-        self.status.configure(text=message)
-        self.open_button.configure(state="disabled" if busy else "normal")
-        self.save_button.configure(state="disabled" if busy or not self.image_path else "normal")
+    def set_form_enabled(self, enabled):
+        for widget in self.inputs.values():
+            widget.configure(state="normal" if enabled else "disabled")
+        self.save_button.configure(state="normal" if enabled else "disabled")
 
     def current_record(self):
         return normalize({key: var.get() for key, var in self.vars.items()})
@@ -138,26 +199,73 @@ class ReviewApp:
             names = ", ".join(LABELS.get(k, k) for k in FIELDS if k in self.uncertain)
             if not messagebox.askyesno("Confirm", f"These fields were hard to read: {names}.\n\nHave you checked them against the photo?"):
                 return
-        try:
-            append_record(record, DATA_FILE)
-        except OSError as e:
-            messagebox.showerror("Save failed", f"Could not write {DATA_FILE}: {e}\nIs it open in Excel?")
+        duplicate = self.store.find_duplicate(record)
+        if duplicate and not messagebox.askyesno(
+            "Possible duplicate",
+            f"A {duplicate['TestType']} test for {duplicate['Name']} on {duplicate['TestDate']} "
+            f"is already recorded (result: {duplicate['Result']}).\n\nSave this one anyway?",
+        ):
             return
-        self.clear()
-        self.status.configure(text=f"Saved {record['Name']} to {DATA_FILE}.")
+        self.store.add(record, source_file=self.current)
+        self.saved += 1
+        self.advance()
 
-    def clear(self):
-        self.image_path, self.preview, self.uncertain = None, None, set()
-        self.image_label.configure(image="", text="No image loaded")
+    def skip(self):
+        self.skipped += 1
+        self.advance()
+
+    def export(self):
+        path = filedialog.asksaveasfilename(
+            defaultextension=".xlsx", initialfile="DrugTests.xlsx", filetypes=[("Excel workbook", "*.xlsx")]
+        )
+        if not path:
+            return
+        try:
+            count = self.store.export_xlsx(path)
+        except OSError as e:
+            messagebox.showerror("Export failed", f"Could not write {path}: {e}\nIs it open in Excel?")
+            return
+        self.status.configure(text=f"Exported {count} records to {path}.")
+
+    def clear_form(self):
+        self.uncertain = set()
+        self.set_form_enabled(True)
         for var in self.vars.values():
             var.set("")
         self.show_hints()
         self.save_button.configure(state="disabled")
 
+    def clear(self):
+        self.preview = None
+        self.image_label.configure(image="", text="No image loaded")
+        self.clear_form()
+        self.skip_button.configure(state="disabled")
+
+    def close(self):
+        remaining = len(self.batch) - self.index
+        if remaining and not messagebox.askyesno("Quit?", f"{remaining} image(s) haven't been saved. Quit anyway?"):
+            return
+        self.pool.shutdown(wait=False, cancel_futures=True)
+        self.store.close()
+        self.root.destroy()
+
+
+def open_store() -> tuple[RecordStore, str | None]:
+    """Open the database, importing the CSV log from earlier versions on first run."""
+    store = RecordStore(DB_FILE)
+    if store.count() == 0 and os.path.exists(LEGACY_CSV):
+        imported, skipped = store.import_csv(LEGACY_CSV)
+        message = f"Imported {imported} records from {LEGACY_CSV}"
+        return store, message + (f" ({skipped} incomplete rows skipped)." if skipped else ".")
+    return store, None
+
 
 def main():
+    store, message = open_store()
     root = tk.Tk()
-    ReviewApp(root)
+    app = ReviewApp(root, store)
+    if message:
+        app.status.configure(text=message)
     root.mainloop()
 
 

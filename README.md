@@ -2,11 +2,15 @@
 
 Turn photos of handwritten drug-test notes into clean spreadsheet records.
 
-1. Open a photo of the note.
+1. Open one or more photos of notes. Up to three are read at a time in the background.
 2. Claude's vision model reads the handwriting and fills in the form. Fields it found hard to read are flagged.
-3. You check each field against the photo, fix anything wrong, and save. Nothing is written until you confirm.
+3. You check each field against the photo, fix anything wrong, then **Save** or **Skip** to move to the next photo. Nothing is written until you confirm.
 
-Records are appended to `DrugTestingOrganizer.csv`, which opens in Excel.
+Records are stored in a local SQLite database (`drugtest.db`). **Export to Excel…** writes a formatted `.xlsx` with real dates, filters, a frozen header row, and Positive / Pending / Inconclusive / Refused results highlighted.
+
+Saving warns you if the same person already has a test of the same type on the same date.
+
+Upgrading from the CSV version: on first run, records in `DrugTestingOrganizer.csv` are imported automatically (incomplete rows are skipped and counted).
 
 ## Setup
 
@@ -22,7 +26,8 @@ Optional settings:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `DRUGTEST_CSV` | `DrugTestingOrganizer.csv` | Where records are saved |
+| `DRUGTEST_DB` | `drugtest.db` | Record database |
+| `DRUGTEST_CSV` | `DrugTestingOrganizer.csv` | Old CSV log imported on first run |
 | `DRUGTEST_MODEL` | `claude-opus-5-5` | Claude model used to read images |
 
 ## Fields and validation
@@ -40,7 +45,7 @@ Optional settings:
 ## Privacy
 
 - Images are sent to the Anthropic API for reading; nothing else leaves the machine. No temporary image files are written.
-- The CSV is unencrypted. Store it somewhere access-controlled. `.gitignore` excludes CSVs and images so real records aren't committed.
+- The database and exported workbooks are unencrypted. Store them somewhere access-controlled. Only the photo's file name is recorded, not its full path. `.gitignore` excludes databases, spreadsheets and images so real records aren't committed.
 
 ## Development
 
