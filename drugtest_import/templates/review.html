@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% block head %}{% if upload.status == 'reading' %}<meta http-equiv="refresh" content="2">{% endif %}{% endblock %}
+{% block title %}Review {{ upload.filename }}{% endblock %}
+{% block content %}
+<p class="muted">Photo {{ position }} of {{ total }} · {{ form.name }} · {{ upload.filename }}</p>
+<div class="review">
+  <div class="photo"><img src="/uploads/{{ upload.id }}/image" alt="Uploaded form {{ upload.filename }}"></div>
+  <form method="post" action="/review/{{ upload.id }}" class="card">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    {% if upload.status == 'reading' %}
+      <p class="alert">Reading the form… this page refreshes automatically.</p>
+    {% elif upload.status == 'failed' %}
+      <p class="alert error">Couldn't read this photo: {{ upload.error }} Enter the fields manually or skip it.</p>
+    {% else %}
+      <p>Check every field against the photo before saving.</p>
+    {% endif %}
+
+    {% set reading = upload.status == 'reading' %}
+    {% for field in form.fields %}
+      {% set problem = problems.get(field.key) %}
+      {% set value = values.get(field.key) or '' %}
+      <label class="{{ 'invalid' if problem else ('uncertain' if field.key in uncertain else '') }}">
+        {{ field.label }}{% if field.required %} <span class="muted">*</span>{% endif %}
+        {% if field.type == 'choice' %}
+          <select name="field_{{ field.key }}" {{ 'disabled' if reading }}>
+            <option value=""></option>
+            {% for c in field.choices %}<option {{ 'selected' if value == c }}>{{ c }}</option>{% endfor %}
+            {% if value and value not in field.choices %}<option selected>{{ value }}</option>{% endif %}
+          </select>
+        {% elif field.type == 'longtext' %}
+          <textarea name="field_{{ field.key }}" rows="3" {{ 'disabled' if reading }}>{{ value }}</textarea>
+        {% else %}
+          <input name="field_{{ field.key }}" value="{{ value }}" {{ 'disabled' if reading }}
+                 {% if field.type == 'date' %}placeholder="YYYY-MM-DD"{% elif field.hint %}placeholder="{{ field.hint }}"{% endif %}>
+        {% endif %}
+        {% if problem %}<small>{{ problem }}</small>{% elif field.key in uncertain %}<small>Hard to read — double-check</small>{% endif %}
+      </label>
+    {% endfor %}
+
+    {% if uncertain and upload.status == 'ready' %}
+      <label class="check"><input type="checkbox" name="confirm_uncertain" value="1">
+        I checked the highlighted fields against the photo</label>
+    {% endif %}
+    {% if duplicate %}
+      <div class="alert error">
+        A matching {{ form.name|lower }} entry is already recorded
+        ({% for key in form.duplicate_keys %}{{ form.field(key).label }}: {{ duplicate['values'].get(key) }}{{ ', ' if not loop.last }}{% endfor %}{% if form.flag_field %}; {{ form.field(form.flag_field).label }}: <strong>{{ duplicate['values'].get(form.flag_field) }}</strong>{% endif %}),
+        entered by {{ duplicate.entered_by }}.
+        <label class="check"><input type="checkbox" name="confirm_duplicate" value="1"> Save this one anyway</label>
+      </div>
+    {% endif %}
+
+    <div class="actions">
+      <button class="primary" name="action" value="save" {{ 'disabled' if reading }}>Save and next</button>
+      <button name="action" value="skip" formnovalidate>Skip and delete photo</button>
+    </div>
+  </form>
+</div>
+{% endblock %}

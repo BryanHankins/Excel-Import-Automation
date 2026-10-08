@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block title %}{{ form.name }} records{% endblock %}
+{% block content %}
+<h1>Records</h1>
+<nav class="tabs">
+  {% for f in forms %}<a href="/records?form={{ f.key }}" class="{{ 'active' if f.key == form.key }}">{{ f.name }}</a>{% endfor %}
+</nav>
+<form method="get" action="/records" class="filters">
+  <input type="hidden" name="form" value="{{ form.key }}">
+  <input name="q" value="{{ filters.q }}" placeholder="Search">
+  {% if form.flag_field %}
+  {% set flag_field = form.field(form.flag_field) %}
+  <select name="flag">
+    <option value="">Any {{ flag_field.label|lower }}</option>
+    {% if form.flag_values %}<option value="*flagged" {{ 'selected' if filters.flag == '*flagged' }}>Highlighted only ({{ form.flag_values|join(', ') }})</option>{% endif %}
+    {% for c in flag_field.choices %}<option {{ 'selected' if filters.flag == c }}>{{ c }}</option>{% endfor %}
+  </select>
+  {% endif %}
+  {% if form.date_field %}
+  <label>From <input type="date" name="start" value="{{ filters.start }}"></label>
+  <label>To <input type="date" name="end" value="{{ filters.end }}"></label>
+  {% endif %}
+  <button>Filter</button>
+  {% if can('reviewer') %}
+  <a class="button" href="/records/export.xlsx?{{ filters|urlencode }}">Export to Excel</a>
+  {% endif %}
+</form>
+<p class="muted">{{ entries|length }} record(s)</p>
+<div class="scroll">
+<table>
+  <thead><tr>{% for field in form.fields %}<th>{{ field.label }}</th>{% endfor %}<th>Entered by</th></tr></thead>
+  <tbody>
+  {% for e in entries %}
+    <tr class="{{ 'flagged' if form.flag_field and e['values'].get(form.flag_field) in form.flag_values }}">
+      {% for field in form.fields %}<td>{{ e['values'].get(field.key) or '' }}</td>{% endfor %}
+      <td>{{ e.entered_by }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% endblock %}

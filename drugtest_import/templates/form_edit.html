@@ -1,0 +1,77 @@
+{% extends "base.html" %}
+{% block title %}Edit {{ form.name }}{% endblock %}
+{% block content %}
+<p><a href="/admin/forms">← Form types</a></p>
+<h1>{{ form.name }}</h1>
+{% if request.query_params.get('saved') %}<p class="alert ok">Saved.</p>{% endif %}
+{% if entry_count %}
+<p class="muted">{{ entry_count }} record(s) use this form type, so its existing fields can't be removed or change type. You can still rename them, edit choices and hints, and add new fields.</p>
+{% endif %}
+
+<form method="post" action="/admin/forms/{{ form.key }}">
+  <input type="hidden" name="csrf" value="{{ csrf }}">
+  <div class="card">
+    <label>Name <input name="name" value="{{ form.name }}" required maxlength="60"></label>
+    <label>What is this document? <small class="muted">Helps the AI read it, e.g. "A daily forklift pre-use checklist".</small>
+      <textarea name="description" rows="2" maxlength="500">{{ form.description }}</textarea></label>
+  </div>
+
+  <h2>Fields</h2>
+  <div class="scroll">
+  <table class="fields">
+    <thead><tr><th>Order</th><th>Label</th><th>Type</th><th>Choices <small>(comma-separated)</small></th><th>Hint for reviewers and the AI</th><th>Required</th><th>Duplicate check</th><th>Remove</th></tr></thead>
+    <tbody>
+    {% for field in form.fields %}
+      {% set i = loop.index0 %}
+      {% set is_locked = field.key in locked %}
+      <tr>
+        <td><input name="f{{ i }}_order" value="{{ loop.index }}" size="2" inputmode="numeric">
+            <input type="hidden" name="f{{ i }}_key" value="{{ field.key }}"></td>
+        <td><input name="f{{ i }}_label" value="{{ field.label }}" maxlength="60" required></td>
+        <td>
+          {% if is_locked %}
+            <input type="hidden" name="f{{ i }}_type" value="{{ field.type }}">{{ types[field.type] }}
+          {% else %}
+            <select name="f{{ i }}_type">{% for t, name in types.items() %}<option value="{{ t }}" {{ 'selected' if field.type == t }}>{{ name }}</option>{% endfor %}</select>
+          {% endif %}
+        </td>
+        <td><input name="f{{ i }}_choices" value="{{ field.choices|join(', ') }}"></td>
+        <td><input name="f{{ i }}_hint" value="{{ field.hint }}" maxlength="300"></td>
+        <td class="center"><input type="checkbox" name="f{{ i }}_required" value="1" {{ 'checked' if field.required }}></td>
+        <td class="center"><input type="checkbox" name="f{{ i }}_duplicate" value="1" {{ 'checked' if field.duplicate_check }}></td>
+        <td class="center">{% if not is_locked %}<input type="checkbox" name="f{{ i }}_remove" value="1">{% endif %}</td>
+      </tr>
+    {% endfor %}
+    {% set n = form.fields|length %}
+      <tr class="new">
+        <td><input name="f{{ n }}_order" value="{{ n + 1 }}" size="2" inputmode="numeric"></td>
+        <td><input name="f{{ n }}_label" placeholder="Add a field…" maxlength="60"></td>
+        <td><select name="f{{ n }}_type">{% for t, name in types.items() %}<option value="{{ t }}">{{ name }}</option>{% endfor %}</select></td>
+        <td><input name="f{{ n }}_choices"></td>
+        <td><input name="f{{ n }}_hint" maxlength="300"></td>
+        <td class="center"><input type="checkbox" name="f{{ n }}_required" value="1"></td>
+        <td class="center"><input type="checkbox" name="f{{ n }}_duplicate" value="1"></td>
+        <td></td>
+      </tr>
+    </tbody>
+  </table>
+  </div>
+  <input type="hidden" name="field_count" value="{{ form.fields|length }}">
+  <p class="muted">Duplicate check: when every ticked field matches an existing record, the reviewer is warned before saving.</p>
+
+  <h2>Records view</h2>
+  <div class="card">
+    <label>Sort and filter by date
+      <select name="date_field"><option value="">None</option>
+        {% for field in form.fields if field.type == 'date' %}<option value="{{ field.key }}" {{ 'selected' if form.date_field == field.key }}>{{ field.label }}</option>{% endfor %}
+      </select></label>
+    <label>Highlight records by
+      <select name="flag_field"><option value="">None</option>
+        {% for field in form.fields if field.type == 'choice' %}<option value="{{ field.key }}" {{ 'selected' if form.flag_field == field.key }}>{{ field.label }}</option>{% endfor %}
+      </select></label>
+    <label>Values to highlight <small class="muted">comma-separated, e.g. Positive, Pending</small>
+      <input name="flag_values" value="{{ form.flag_values|join(', ') }}"></label>
+  </div>
+  <div class="actions"><button class="primary">Save form type</button></div>
+</form>
+{% endblock %}

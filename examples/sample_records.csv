@@ -1,0 +1,5 @@
+EmployeeID,Name,Department,TestDate,TestType,Result,Notes
+EMP001,John Doe,HR,2025-09-15,Urine,Negative,Scheduled annual test
+EMP002,Jane Smith,IT,2025-09-15,Blood,Pending,Awaiting lab results
+EMP003,Alex Johnson,Operations,2025-09-16,Hair,Positive,Follow-up required
+EMP004,Sarah Lee,Finance,2025-09-17,Saliva,Negative,Random test
