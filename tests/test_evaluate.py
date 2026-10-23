@@ -44,7 +44,8 @@ def label(folder, rows, header=None):
         csv.writer(f).writerows([header] + rows)
 
 
-def test_evaluate_scores_fields_and_flags(folder):
+def test_evaluate_scores_fields_and_flags(folder, monkeypatch):
+    monkeypatch.setattr(evaluate.extract, "ENGINE", "anthropic")
     good = ["EMP005", "Bob Wilson", "", "2025-09-18", "Urine", "Negative", "?"]
     label(folder, [["a.jpg"] + good, ["b.png"] + good, ["c.png"] + good])
     report = evaluate.evaluate(str(folder), DRUG_TEST, workers=2, reader=fake_reader)
@@ -88,3 +89,11 @@ def test_cli_init_and_unknown_form(folder, capsys):
     assert "Incident date" in (folder / "labels.csv").read_text()
     assert evaluate.main(["init", str(folder), "--form", "nope"]) == 1
     assert "No form type 'nope'" in capsys.readouterr().err
+
+
+def test_local_engine_reports_free(folder, monkeypatch):
+    monkeypatch.setattr(evaluate.extract, "ENGINE", "ollama")
+    label(folder, [["a.jpg", "EMP005", "Bob Wilson", "", "2025-09-18", "Urine", "Negative", ""]])
+    report = evaluate.evaluate(str(folder), DRUG_TEST, reader=fake_reader)
+    assert report.cost() == 0
+    assert "Cost: $0 - runs on this computer" in evaluate.summary(report)
