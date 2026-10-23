@@ -1,0 +1,76 @@
+{% extends "base.html" %}
+{% block title %}{{ form.name }} record{% endblock %}
+{% block content %}
+<p><a href="/records?form={{ form.key }}">← {{ form.name }} records</a></p>
+<h1>{{ form.name }} record</h1>
+{% if saved %}<p class="alert ok">Saved.</p>{% endif %}
+<p class="muted">Entered by {{ entry.entered_by }} on {{ entry.entered_at[:16].replace('T', ' ') }} UTC{% if entry.source_file %} from {{ entry.source_file }}{% endif %}.</p>
+
+<div class="review">
+<div>
+{% if can('reviewer') %}
+<form method="post" action="/records/{{ form.key }}/{{ entry.id }}" class="card">
+  <input type="hidden" name="csrf" value="{{ csrf }}">
+  {% for field in form.fields %}
+    {% set problem = problems.get(field.key) %}
+    {% set value = values.get(field.key) or '' %}
+    <label class="{{ 'invalid' if problem }}">
+      {{ field.label }}{% if field.required %} <span class="muted">*</span>{% endif %}
+      {% if field.type == 'choice' %}
+        <select name="field_{{ field.key }}">
+          <option value=""></option>
+          {% for c in field.choices %}<option {{ 'selected' if value == c }}>{{ c }}</option>{% endfor %}
+          {% if value and value not in field.choices %}<option selected>{{ value }}</option>{% endif %}
+        </select>
+      {% elif field.type == 'longtext' %}
+        <textarea name="field_{{ field.key }}" rows="3">{{ value }}</textarea>
+      {% else %}
+        <input name="field_{{ field.key }}" value="{{ value }}" {% if field.type == 'date' %}placeholder="YYYY-MM-DD"{% endif %}>
+      {% endif %}
+      {% if problem %}<small>{{ problem }}</small>{% endif %}
+    </label>
+  {% endfor %}
+  {% if duplicate %}
+    <div class="alert error">
+      Another matching record exists ({% for key in form.duplicate_keys %}{{ form.field(key).label }}: {{ duplicate['values'].get(key) }}{{ ', ' if not loop.last }}{% endfor %}).
+      <a href="/records/{{ form.key }}/{{ duplicate.id }}">View it</a>.
+      <label class="check"><input type="checkbox" name="confirm_duplicate" value="1"> Save anyway</label>
+    </div>
+  {% endif %}
+  <div class="actions"><button class="primary">Save changes</button></div>
+</form>
+{% else %}
+<div class="card">
+  <dl class="fields">
+  {% for field in form.fields %}<dt>{{ field.label }}</dt><dd>{{ values.get(field.key) or '—' }}</dd>{% endfor %}
+  </dl>
+</div>
+{% endif %}
+</div>
+
+<div>
+  <h2>Change history</h2>
+  {% if history %}
+    {% for edit in history %}
+    <div class="card history">
+      <p class="muted">{{ edit.at[:16].replace('T', ' ') }} UTC · {{ edit.by }}</p>
+      <ul>{% for label, before, after in edit.fields %}<li><strong>{{ label }}</strong>: {{ before or '(blank)' }} → {{ after or '(blank)' }}</li>{% endfor %}</ul>
+    </div>
+    {% endfor %}
+  {% else %}
+    <p class="muted">Not changed since it was entered.</p>
+  {% endif %}
+
+  {% if can('admin') %}
+  <h2>Delete</h2>
+  <form method="post" action="/records/{{ form.key }}/{{ entry.id }}/delete" class="card">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <p class="muted">Deleting removes this record and its history permanently. The audit log keeps who deleted it, when and why.</p>
+    <label>Reason <input name="reason" maxlength="200" required placeholder="e.g. Entered twice"></label>
+    <label class="check"><input type="checkbox" name="confirm_delete" value="1" required> Permanently delete this record</label>
+    <div class="actions"><button class="danger">Delete record</button></div>
+  </form>
+  {% endif %}
+</div>
+</div>
+{% endblock %}

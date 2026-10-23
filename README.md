@@ -64,6 +64,32 @@ python -m drugtest_import.app
 
 Requires Tk (included with the python.org installers). Choose the form type in the toolbar before opening images. Records from the old `DrugTestingOrganizer.csv` are imported as drug tests on first run.
 
+### Fixing and deleting records
+
+Click a record's first column on the **Records** page to open it.
+
+- Reviewers can correct any field. Every change is kept: the record page shows a change history (who, when, old → new), and the audit log notes which fields changed.
+- Admins can permanently delete a record, for example one entered twice. They must give a reason; the audit log keeps who, when and why, but not the deleted data.
+
+### Measuring accuracy and cost
+
+Before selling, measure how well the AI reads *your* forms:
+
+```
+python -m drugtest_import.evaluate init photos/ --form drug-test   # creates photos/labels.csv
+# Fill in labels.csv with what each form actually says (empty = blank on the form, ? = don't check)
+python -m drugtest_import.evaluate run photos/ --form drug-test    # calls the paid API once per photo
+```
+
+The report shows:
+
+- field accuracy, and the share of photos with every field right;
+- **silent errors**: wrong values the AI did *not* flag as hard to read. These are the ones a reviewer could miss, so keep them near zero;
+- accuracy for each field;
+- tokens and cost per photo.
+
+Use `--model claude-sonnet-5-5` to compare a cheaper model, and `--limit 10` for a quick trial. Per-field results are written to `photos/accuracy-results.csv`. That file and `labels.csv` contain form contents, so keep them as private as the photos.
+
 ### Other admin commands
 
 ```

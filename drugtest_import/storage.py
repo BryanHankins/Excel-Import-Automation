@@ -40,6 +40,15 @@ CREATE TABLE IF NOT EXISTS entries (
 CREATE INDEX IF NOT EXISTS entries_form ON entries (form_key, record_date);
 CREATE INDEX IF NOT EXISTS entries_duplicates ON entries (form_key, duplicate_index);
 
+CREATE TABLE IF NOT EXISTS entry_versions (
+    id INTEGER PRIMARY KEY,
+    entry_id INTEGER NOT NULL,
+    data BLOB NOT NULL,         -- encrypted JSON of the values before a change
+    replaced_at TEXT NOT NULL,
+    replaced_by TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS entry_versions_entry ON entry_versions (entry_id);
+
 CREATE TABLE IF NOT EXISTS uploads (
     id TEXT PRIMARY KEY,
     form_key TEXT NOT NULL REFERENCES forms (key),
@@ -275,14 +284,64 @@ class Database:
             )
         return entry_id
 
-    def find_duplicate(self, form: FormTemplate, values: dict) -> dict | None:
+    def find_duplicate(self, form: FormTemplate, values: dict, exclude_id: int | None = None) -> dict | None:
         """Return an existing entry of this form type whose duplicate-check fields all match."""
         index = self._duplicate_index(form, values)
         if not index:
             return None
-        row = self._fetchone("SELECT * FROM entries WHERE form_key = ? AND duplicate_index = ? LIMIT 1",
-                             (form.key, index))
+        row = self._fetchone(
+            "SELECT * FROM entries WHERE form_key = ? AND duplicate_index = ? AND id IS NOT ? LIMIT 1",
+            (form.key, index, exclude_id))
         return self._to_entry(row) if row else None
+
+    def get_entry(self, entry_id: int) -> dict | None:
+        row = self._fetchone("SELECT * FROM entries WHERE id = ?", (entry_id,))
+        return self._to_entry(row) if row else None
+
+    def update_entry(self, form: FormTemplate, entry_id: int, values: dict, actor: str) -> list[str]:
+        """Replace an entry's values, keeping the old ones in its history. Returns the changed field keys."""
+        values = {key: values.get(key) for key in form.keys}
+        with self._lock, self.conn:
+            row = self.conn.execute("SELECT * FROM entries WHERE id = ? AND form_key = ?",
+                                    (entry_id, form.key)).fetchone()
+            if not row:
+                raise ValueError("No such record.")
+            old = json.loads(self.cipher.decrypt(row["data"]))
+            changed = [key for key in form.keys if (old.get(key) or None) != (values.get(key) or None)]
+            if not changed:
+                return []
+            # Keep values of fields no longer on the form, so nothing is silently lost
+            kept = {k: v for k, v in old.items() if k not in form.keys}
+            self.conn.execute(
+                "INSERT INTO entry_versions (entry_id, data, replaced_at, replaced_by) VALUES (?, ?, ?, ?)",
+                (entry_id, row["data"], now(), actor))
+            self.conn.execute(
+                "UPDATE entries SET data = ?, duplicate_index = ?, record_date = ? WHERE id = ?",
+                (self.cipher.encrypt(json.dumps(kept | values)), self._duplicate_index(form, values),
+                 values.get(form.date_field) if form.date_field else None, entry_id))
+            self.conn.execute(
+                "INSERT INTO audit_log (at, actor, action, target, detail) VALUES (?, ?, 'entry.update', ?, ?)",
+                (now(), actor, f"{form.key}/{entry_id}",
+                 "changed: " + ", ".join(form.field(k).label for k in changed)))
+        return changed
+
+    def delete_entry(self, entry_id: int, actor: str, reason: str) -> None:
+        """Permanently delete an entry and its history. The audit log keeps who, when and why - not the data."""
+        with self._lock, self.conn:
+            row = self.conn.execute("SELECT form_key FROM entries WHERE id = ?", (entry_id,)).fetchone()
+            if not row:
+                raise ValueError("No such record.")
+            self.conn.execute("DELETE FROM entry_versions WHERE entry_id = ?", (entry_id,))
+            self.conn.execute("DELETE FROM entries WHERE id = ?", (entry_id,))
+            self.conn.execute(
+                "INSERT INTO audit_log (at, actor, action, target, detail) VALUES (?, ?, 'entry.delete', ?, ?)",
+                (now(), actor, f"{row['form_key']}/{entry_id}", f"reason: {reason}"))
+
+    def entry_history(self, entry_id: int) -> list[dict]:
+        """Earlier versions of an entry, oldest first: [{"values", "replaced_at", "replaced_by"}]."""
+        rows = self._fetchall("SELECT * FROM entry_versions WHERE entry_id = ? ORDER BY id", (entry_id,))
+        return [{"values": json.loads(self.cipher.decrypt(r["data"])), "replaced_at": r["replaced_at"],
+                 "replaced_by": r["replaced_by"]} for r in rows]
 
     def entries(self, form_key: str) -> list[dict]:
         rows = self._fetchall(

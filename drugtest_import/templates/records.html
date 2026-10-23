@@ -2,6 +2,7 @@
 {% block title %}{{ form.name }} records{% endblock %}
 {% block content %}
 <h1>Records</h1>
+{% if request.query_params.get('deleted') %}<p class="alert ok">Record deleted.</p>{% endif %}
 <nav class="tabs">
   {% for f in forms %}<a href="/records?form={{ f.key }}" class="{{ 'active' if f.key == form.key }}">{{ f.name }}</a>{% endfor %}
 </nav>
@@ -32,7 +33,7 @@
   <tbody>
   {% for e in entries %}
     <tr class="{{ 'flagged' if form.flag_field and e['values'].get(form.flag_field) in form.flag_values }}">
-      {% for field in form.fields %}<td>{{ e['values'].get(field.key) or '' }}</td>{% endfor %}
+      {% for field in form.fields %}<td>{% if loop.first %}<a href="/records/{{ form.key }}/{{ e.id }}">{{ e['values'].get(field.key) or 'Open' }}</a>{% else %}{{ e['values'].get(field.key) or '' }}{% endif %}</td>{% endfor %}
       <td>{{ e.entered_by }}</td>
     </tr>
   {% endfor %}
