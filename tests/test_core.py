@@ -117,7 +117,7 @@ def test_extract_fields_through_real_sdk():
         return httpx.Response(200, json={
             "id": "msg_1", "type": "message", "role": "assistant", "model": sent["model"],
             "content": [{"type": "text", "text": json.dumps(answer)}], "stop_reason": "end_turn",
-            "stop_sequence": None, "usage": {"input_tokens": 1, "output_tokens": 1},
+            "stop_sequence": None, "usage": {"input_tokens": 1800, "output_tokens": 350, "cache_read_input_tokens": 200},
         })
 
     client = anthropic.Anthropic(api_key="test", http_client=anthropic.DefaultHttpxClient(transport=httpx.MockTransport(handler)))
@@ -129,6 +129,9 @@ def test_extract_fields_through_real_sdk():
     schema = sent["output_config"]["format"]["schema"]
     assert set(schema["properties"]) == set(DRUG_TEST.keys) | {"uncertain_fields"}
     assert sent["fallbacks"] == "default"
+
+    reading = extract.read_form(png_file(), DRUG_TEST, client=client)
+    assert (reading.model, reading.input_tokens, reading.output_tokens) == ("claude-opus-5-5", 2000, 350)
 
 
 class FakeClient:
@@ -317,3 +320,35 @@ def test_password_hashing():
     assert verify_password("correct horse battery", stored)
     assert not verify_password("wrong", stored)
     assert not verify_password("x", "garbage")
+
+
+def test_update_entry_keeps_history(store):
+    entry_id = add(store)
+    record = store.get_entry(entry_id)["values"]
+    assert store.update_entry(DRUG_TEST, entry_id, record, "tester") == []  # no change, no version
+    changed = store.update_entry(DRUG_TEST, entry_id, {**record, "result": "Positive", "test_date": "2025-09-17"}, "editor")
+    assert changed == ["test_date", "result"]
+    entry = store.get_entry(entry_id)
+    assert entry["values"]["result"] == "Positive" and entry["entered_by"] == "tester"
+    [old] = store.entry_history(entry_id)
+    assert old["values"]["result"] == "Negative" and old["replaced_by"] == "editor"
+    # Duplicate index and sort date follow the new values
+    assert store.find_duplicate(DRUG_TEST, {**record, "test_date": "2025-09-17"})
+    assert store.find_duplicate(DRUG_TEST, record) is None
+    assert store.find_duplicate(DRUG_TEST, entry["values"], exclude_id=entry_id) is None
+    assert store.conn.execute("SELECT record_date FROM entries").fetchone()[0] == "2025-09-17"
+    audit = store.audit_entries()[0]
+    assert (audit["action"], audit["detail"]) == ("entry.update", "changed: Test date, Result")
+    assert b"Positive" not in b"".join(store.conn.execute("SELECT data FROM entry_versions").fetchone())
+    with pytest.raises(ValueError):
+        store.update_entry(SAFETY_INCIDENT, entry_id, {}, "tester")  # wrong form type
+
+
+def test_delete_entry(store):
+    entry_id = add(store)
+    store.update_entry(DRUG_TEST, entry_id, {**store.get_entry(entry_id)["values"], "notes": "x"}, "tester")
+    store.delete_entry(entry_id, "boss", "entered twice")
+    assert store.get_entry(entry_id) is None and store.entry_history(entry_id) == []
+    assert store.audit_entries()[0]["detail"] == "reason: entered twice"
+    with pytest.raises(ValueError):
+        store.delete_entry(entry_id, "boss", "again")

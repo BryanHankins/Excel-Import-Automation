@@ -2,6 +2,7 @@
 import base64
 import io
 import os
+from dataclasses import dataclass
 from typing import BinaryIO
 
 import anthropic
@@ -15,6 +16,16 @@ MAX_SIDE = 1568  # larger images are downscaled by the API anyway
 
 class ExtractionError(Exception):
     pass
+
+
+@dataclass
+class Reading:
+    """What the model read from one image."""
+    values: dict  # field key -> value or None
+    uncertain: list[str]  # keys of fields that were hard to read
+    model: str = ""
+    input_tokens: int = 0
+    output_tokens: int = 0  # includes thinking
 
 
 def encode_image(image: str | BinaryIO) -> tuple[str, str]:
@@ -34,6 +45,12 @@ def encode_image(image: str | BinaryIO) -> tuple[str, str]:
 def extract_fields(image: str | BinaryIO, form: FormTemplate,
                    client: anthropic.Anthropic | None = None) -> tuple[dict, list[str]]:
     """Read the form in the image. Returns ({field key: value or None}, keys of hard-to-read fields)."""
+    reading = read_form(image, form, client)
+    return reading.values, reading.uncertain
+
+
+def read_form(image: str | BinaryIO, form: FormTemplate, client: anthropic.Anthropic | None = None) -> Reading:
+    """Like extract_fields, but also reports which model answered and the tokens used."""
     client = client or anthropic.Anthropic()
     media_type, data = encode_image(image)
     try:
@@ -65,4 +82,11 @@ def extract_fields(image: str | BinaryIO, form: FormTemplate,
         raise ExtractionError("The model declined to read this image. Enter the fields manually.")
     if response.stop_reason == "max_tokens" or response.parsed_output is None:
         raise ExtractionError("The model returned an incomplete answer. Try again or enter fields manually.")
-    return extraction_values(form, response.parsed_output)
+    values, uncertain = extraction_values(form, response.parsed_output)
+    usage = getattr(response, "usage", None)
+    return Reading(
+        values=values, uncertain=uncertain, model=getattr(response, "model", "") or MODEL,
+        input_tokens=(getattr(usage, "input_tokens", 0) or 0) + (getattr(usage, "cache_read_input_tokens", 0) or 0)
+                     + (getattr(usage, "cache_creation_input_tokens", 0) or 0),
+        output_tokens=getattr(usage, "output_tokens", 0) or 0,
+    )

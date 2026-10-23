@@ -256,3 +256,45 @@ def test_admin_form_editor(app, db):
     assert db.get_form("training-signoff") is None
     actions = [e["action"] for e in db.audit_entries()]
     assert {"form.create", "form.update", "form.delete"} <= set(actions)
+
+
+def test_view_edit_and_delete_record(app, db):
+    from drugtest_import.forms import DRUG_TEST
+    values = {"employee_id": "EMP005", "name": "Bob Wilson", "department": None, "test_date": "2025-09-18",
+              "test_type": "Urine", "result": "Negative", "notes": None}
+    entry_id = db.add_entry(DRUG_TEST, values, "reviewer")
+    other_id = db.add_entry(DRUG_TEST, {**values, "name": "Ann Lee"}, "reviewer")
+    url = f"/records/drug-test/{entry_id}"
+
+    viewer = login(app, "viewer")
+    page = viewer.get(url).text
+    assert "Bob Wilson" in page and "Save changes" not in page and "Delete record" not in page
+    assert f'href="{url}"' in viewer.get("/records?form=drug-test").text
+    assert viewer.post(url, data={"csrf": csrf(viewer, url)}).status_code == 403
+    assert viewer.get(f"/records/safety-incident/{entry_id}", follow_redirects=False).status_code == 303
+
+    reviewer = login(app, "reviewer")
+    token = csrf(reviewer, url)
+    form = {"csrf": token, **{f"field_{k}": v or "" for k, v in values.items()}}
+    assert "Nothing changed" in reviewer.post(url, data=form).text
+    assert reviewer.post(url, data={**form, "field_result": "Maybe"}).status_code == 422
+    response = reviewer.post(url, data={**form, "field_name": "Ann Lee"})
+    assert response.status_code == 409 and f"/records/drug-test/{other_id}" in response.text
+    response = reviewer.post(url, data={**form, "field_result": "positive"}, follow_redirects=False)
+    assert response.headers["location"] == f"{url}?saved=1"
+    page = reviewer.get(f"{url}?saved=1").text
+    assert "Saved." in page and "Negative → Positive" in page
+    assert db.get_entry(entry_id)["values"]["result"] == "Positive"
+    assert reviewer.post(f"{url}/delete", data={"csrf": token, "reason": "x", "confirm_delete": "1"}).status_code == 403
+
+    admin = login(app, "admin")
+    token = csrf(admin, url)
+    assert admin.post(f"{url}/delete", data={"csrf": token, "reason": "dup"}).status_code == 422
+    assert admin.post(f"{url}/delete", data={"csrf": token, "reason": " ", "confirm_delete": "1"}).status_code == 422
+    response = admin.post(f"{url}/delete", data={"csrf": token, "reason": "Entered twice", "confirm_delete": "1"},
+                          follow_redirects=False)
+    assert response.headers["location"] == "/records?form=drug-test&deleted=1"
+    assert db.get_entry(entry_id) is None
+    actions = [(e["action"], e["detail"]) for e in db.audit_entries()]
+    assert ("entry.delete", "reason: Entered twice") in actions and ("entry.update", "changed: Result") in actions
+    assert any(a == "entry.view" for a, _ in actions)

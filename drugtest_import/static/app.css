@@ -67,3 +67,10 @@ table.fields input[size] { width: 3.5em; min-width: 0; }
 td.center { text-align: center; }
 tr.new td { background: var(--bg); }
 table.fields td:nth-child(2) input { min-width: 160px; }
+.danger { background: var(--error); color: var(--accent-text); border-color: var(--error); }
+.history { padding: 10px 14px; margin-bottom: 8px; }
+.history p { margin: 0 0 4px; }
+.history ul { margin: 0; padding-left: 18px; }
+dl.fields { display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; margin: 0; }
+dl.fields dt { font-weight: 600; }
+dl.fields dd { margin: 0; white-space: pre-wrap; }

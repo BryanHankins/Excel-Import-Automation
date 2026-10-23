@@ -377,6 +377,66 @@ def create_app(db: Database | None = None, extractor=extract_fields, workers: in
         return Response(data, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
+    # --- a single record --------------------------------------------------------
+
+    def get_entry_or_404(form_key: str, entry_id: int) -> tuple[FormTemplate, dict]:
+        form = get_form_or_400(form_key)
+        entry = db.get_entry(entry_id)
+        if not entry or entry["form_key"] != form.key:
+            raise Redirect(f"/records?form={form.key}")
+        return form, entry
+
+    def changes(form: FormTemplate, entry: dict) -> list[dict]:
+        """Each edit as {"at", "by", "fields": [(label, before, after)]}, newest first."""
+        versions = db.entry_history(entry["id"])
+        states = [v["values"] for v in versions] + [entry["values"]]
+        edits = []
+        for version, before, after in zip(versions, states, states[1:]):
+            fields = [(f.label, before.get(f.key), after.get(f.key)) for f in form.fields
+                      if (before.get(f.key) or None) != (after.get(f.key) or None)]
+            edits.append({"at": version["replaced_at"], "by": version["replaced_by"], "fields": fields})
+        return edits[::-1]
+
+    def entry_page(request, form, entry, values=None, status_code=200, **extra):
+        return render(request, "entry.html", {
+            "form": form, "entry": entry, "values": values or entry["values"], "problems": {},
+            "history": changes(form, entry), **extra}, status_code=status_code)
+
+    @app.get("/records/{form_key}/{entry_id}", response_class=HTMLResponse)
+    def entry_detail(request: Request, form_key: str, entry_id: int, user: dict = Depends(viewer)):
+        form, entry = get_entry_or_404(form_key, entry_id)
+        db.log(user["username"], "entry.view", f"{form.key}/{entry_id}")
+        return entry_page(request, form, entry, saved=request.query_params.get("saved"))
+
+    @app.post("/records/{form_key}/{entry_id}")
+    async def entry_update(request: Request, form_key: str, entry_id: int, user: dict = Depends(reviewer)):
+        await check_csrf(request)
+        submitted = await request.form()
+        form, entry = get_entry_or_404(form_key, entry_id)
+        values = normalize(form, {key: submitted.get(f"field_{key}") for key in form.keys})
+        problems = validate(form, values)
+        if problems:
+            return entry_page(request, form, entry, values, 422, problems=problems,
+                              error="Fix the highlighted fields before saving.")
+        duplicate = db.find_duplicate(form, values, exclude_id=entry_id)
+        if duplicate and not submitted.get("confirm_duplicate"):
+            return entry_page(request, form, entry, values, 409, duplicate=duplicate)
+        if not db.update_entry(form, entry_id, values, user["username"]):
+            return entry_page(request, form, entry, values, error="Nothing changed.")
+        return RedirectResponse(f"/records/{form.key}/{entry_id}?saved=1", status_code=303)
+
+    @app.post("/records/{form_key}/{entry_id}/delete")
+    async def entry_delete(request: Request, form_key: str, entry_id: int, user: dict = Depends(admin)):
+        await check_csrf(request)
+        submitted = await request.form()
+        form, entry = get_entry_or_404(form_key, entry_id)
+        reason = " ".join((submitted.get("reason") or "").split())[:200]
+        if not submitted.get("confirm_delete") or not reason:
+            return entry_page(request, form, entry, status_code=422,
+                              error="To delete, give a reason and tick the confirmation box.")
+        db.delete_entry(entry_id, user["username"], reason)
+        return RedirectResponse(f"/records?form={form.key}&deleted=1", status_code=303)
+
     # --- admin ------------------------------------------------------------
 
     @app.get("/admin/users", response_class=HTMLResponse)
