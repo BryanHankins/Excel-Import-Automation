@@ -97,3 +97,10 @@ def test_local_engine_reports_free(folder, monkeypatch):
     report = evaluate.evaluate(str(folder), DRUG_TEST, reader=fake_reader)
     assert report.cost() == 0
     assert "Cost: $0 - runs on this computer" in evaluate.summary(report)
+
+
+def test_missing_folder_and_labels_explained(tmp_path):
+    with pytest.raises(ValueError, match="doesn't exist. Create it"):
+        evaluate.write_template(str(tmp_path / "photos"), DRUG_TEST)
+    with pytest.raises(ValueError, match="Run 'init' first"):
+        evaluate.evaluate(str(tmp_path), DRUG_TEST, reader=fake_reader)

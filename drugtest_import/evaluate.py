@@ -36,7 +36,14 @@ PRICES = {
 
 
 def find_images(folder: str) -> list[str]:
+    check_folder(folder)
     return sorted(f for f in os.listdir(folder) if os.path.splitext(f)[1].lower() in IMAGE_EXTENSIONS)
+
+
+def check_folder(folder: str) -> None:
+    if not os.path.isdir(folder):
+        raise ValueError(f"The folder {os.path.abspath(folder)} doesn't exist. Create it and copy your form photos "
+                         f"into it first.")
 
 
 def load_form(key: str) -> FormTemplate:
@@ -82,6 +89,9 @@ def load_labels(folder: str, form: FormTemplate) -> dict[str, dict]:
     """{file name: {field key: expected value, or SKIP}} from labels.csv (headers = labels or keys)."""
     by_header = {f.key: f.key for f in form.fields} | {f.label.lower(): f.key for f in form.fields}
     labels = {}
+    check_folder(folder)
+    if not os.path.exists(os.path.join(folder, "labels.csv")):
+        raise ValueError(f"No labels.csv in {os.path.abspath(folder)}. Run 'init' first, then fill it in.")
     with open(os.path.join(folder, "labels.csv"), newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         unknown = [h for h in reader.fieldnames or [] if h != "file" and (h or "").lower() not in by_header]
