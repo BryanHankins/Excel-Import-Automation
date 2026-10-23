@@ -5,6 +5,7 @@
   python -m drugtest_import.manage set-password NAME
   python -m drugtest_import.manage import-csv PATH [--form FORM_KEY]
   python -m drugtest_import.manage list-forms
+  python -m drugtest_import.manage check-ai
 """
 import argparse
 import getpass
@@ -41,12 +42,24 @@ def main(argv=None):
     imp.add_argument("path")
     imp.add_argument("--form", default="drug-test", help="form type key (see list-forms)")
     commands.add_parser("list-forms", help="list form types and their keys")
+    commands.add_parser("check-ai", help="check the AI engine is set up (Ollama running, model downloaded)")
     args = parser.parse_args(argv)
 
     if args.command == "gen-key":
         print(generate_key())
         print("Store this key somewhere safe (e.g. a password manager). Without it the data can't be read.",
               file=sys.stderr)
+        return 0
+    if args.command == "check-ai":
+        from . import extract
+        if extract.ENGINE != "ollama":
+            print(f"Engine: {extract.ENGINE}, model {extract.MODEL}. Nothing to check locally.")
+            return 0
+        try:
+            print(extract.check_ollama())
+        except extract.ExtractionError as e:
+            print(f"Not ready: {e}", file=sys.stderr)
+            return 1
         return 0
     try:
         db = open_db()

@@ -1,4 +1,4 @@
-"""Web app: sign in, upload photos, review what Claude read, browse and export records.
+"""Web app: sign in, upload photos, review what the AI read, browse and export records.
 
 Run with:  python -m drugtest_import.web   (or: uvicorn --factory drugtest_import.web:create_app)
 """
@@ -22,6 +22,7 @@ from pydantic import ValidationError
 from starlette.middleware.sessions import SessionMiddleware
 
 from .crypto import Cipher, hash_password, verify_password
+from . import extract
 from .extract import ExtractionError, extract_fields
 from .forms import FIELD_TYPES, FieldDef, FormTemplate, make_key, normalize, validate
 from .storage import ROLES, Database, FormInUse
@@ -63,13 +64,13 @@ class BadRequest(Exception):
     pass
 
 
-def create_app(db: Database | None = None, extractor=extract_fields, workers: int = 3) -> FastAPI:
+def create_app(db: Database | None = None, extractor=extract_fields, workers: int | None = None) -> FastAPI:
     if db is None:
         db_path = os.environ.get("DRUGTEST_DB", "drugtest.db")
         db = Database(db_path, Cipher.from_env(), os.environ.get("DRUGTEST_UPLOADS"))
     secure_cookies = os.environ.get("DRUGTEST_INSECURE_COOKIES") != "1"
 
-    pool = ThreadPoolExecutor(max_workers=workers)
+    pool = ThreadPoolExecutor(max_workers=workers or extract.PARALLEL)
 
     @asynccontextmanager
     async def lifespan(app):

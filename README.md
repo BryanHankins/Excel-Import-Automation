@@ -3,7 +3,7 @@
 Turn photos of handwritten or printed paper forms into clean, searchable records.
 
 1. Pick a form type and upload one or more photos.
-2. Claude's vision model reads each form and fills in that form type's fields. Fields it found hard to read are flagged.
+2. A vision AI model reads each form and fills in that form type's fields. By default it's a free, open-source model running on your own computer, so photos never leave the machine and there are no per-scan fees. Fields it found hard to read are flagged.
 3. A reviewer checks each field against the photo, fixes anything wrong, and saves or skips. Nothing is stored until a person confirms.
 4. Search, filter and export records to a formatted Excel workbook.
 
@@ -32,12 +32,33 @@ There are two ways to run it, sharing the same database format:
 
 Requires Python 3.10+.
 
+**1. Install the app**
+
 ```
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
+```
+
+**2. Install the free AI model**
+
+Install Ollama from https://ollama.com (Windows, Mac or Linux). Then, in a terminal:
+
+```
+ollama pull qwen3-vl:8b                         # one-time download, several GB
+python -m drugtest_import.manage check-ai       # confirms everything is ready
+```
+
+A computer with 16 GB of RAM is comfortable. A graphics card (NVIDIA, or an Apple Silicon Mac) makes reading much faster; on a CPU alone, expect up to a minute or more per photo. Other models work too. Try a few with the accuracy tool below and set `DRUGTEST_MODEL` to the one that reads your forms best.
+
+**3. Create the encryption key**
+
+```
 python -m drugtest_import.manage gen-key        # prints a key - store it in a password manager
-export DRUGTEST_KEY=<that key>                  # Windows: set DRUGTEST_KEY=<that key>
-export ANTHROPIC_API_KEY=sk-ant-...
 ```
+
+Set it before running the app:
+
+- Mac/Linux: `export DRUGTEST_KEY=<that key>`
+- Windows PowerShell: `$env:DRUGTEST_KEY = "<that key>"`
 
 **Keep `DRUGTEST_KEY` safe and backed up separately from the database.** All records are encrypted with it; without it they can't be recovered.
 
@@ -78,7 +99,7 @@ Before selling, measure how well the AI reads *your* forms:
 ```
 python -m drugtest_import.evaluate init photos/ --form drug-test   # creates photos/labels.csv
 # Fill in labels.csv with what each form actually says (empty = blank on the form, ? = don't check)
-python -m drugtest_import.evaluate run photos/ --form drug-test    # calls the paid API once per photo
+python -m drugtest_import.evaluate run photos/ --form drug-test    # reads each photo with the AI
 ```
 
 The report shows:
@@ -86,9 +107,9 @@ The report shows:
 - field accuracy, and the share of photos with every field right;
 - **silent errors**: wrong values the AI did *not* flag as hard to read. These are the ones a reviewer could miss, so keep them near zero;
 - accuracy for each field;
-- tokens and cost per photo.
+- time per photo (and cost, for the optional paid engine).
 
-Use `--model claude-sonnet-5-5` to compare a cheaper model, and `--limit 10` for a quick trial. Per-field results are written to `photos/accuracy-results.csv`. That file and `labels.csv` contain form contents, so keep them as private as the photos.
+Use `--limit 5` for a quick trial and `--model <name>` to compare models (pull each one with `ollama pull` first). Per-field results are written to `photos/accuracy-results.csv`. That file and `labels.csv` contain form contents, so keep them as private as the photos.
 
 ### Other admin commands
 
@@ -107,10 +128,13 @@ Databases created by earlier versions (drug tests only) are upgraded automatical
 | Variable | Default | Purpose |
 |---|---|---|
 | `DRUGTEST_KEY` | — (required) | Encryption key from `manage gen-key` |
-| `ANTHROPIC_API_KEY` | — (required) | Used to read photos |
 | `DRUGTEST_DB` | `drugtest.db` | Database file |
 | `DRUGTEST_UPLOADS` | `uploads/` next to the database | Encrypted photos awaiting review |
-| `DRUGTEST_MODEL` | `claude-opus-5-5` | Claude model used to read images |
+| `DRUGTEST_ENGINE` | `ollama` | `ollama` (free, local) or `anthropic` (optional paid API; needs `pip install anthropic` and `ANTHROPIC_API_KEY`) |
+| `DRUGTEST_MODEL` | `qwen3-vl:8b` | Model used to read images |
+| `DRUGTEST_OLLAMA_URL` | `http://localhost:11434` | Where Ollama is running |
+| `DRUGTEST_TIMEOUT` | `900` | Seconds to wait for one photo |
+| `DRUGTEST_PARALLEL` | `1` (Ollama) | Photos read at the same time |
 | `DRUGTEST_HOST` / `DRUGTEST_PORT` | `127.0.0.1` / `8000` | Web server address |
 | `DRUGTEST_INSECURE_COOKIES` | unset | Set to `1` only to test over plain HTTP on a non-localhost address |
 | `DRUGTEST_CSV` | `DrugTestingOrganizer.csv` | Old CSV log the desktop app imports on first run |
@@ -122,7 +146,7 @@ Databases created by earlier versions (drug tests only) are upgraded automatical
 - **Web hardening:** CSRF tokens on every form, `SameSite=Strict` secure cookies, a strict Content-Security-Policy with no JavaScript, and `no-store` caching.
 - **Audit log:** sign-ins (including failures), uploads, saves, skips, record views, exports and user changes are logged with who and when. The log is append-only in the database.
 - **Not encrypted:** Excel exports are plain workbooks for handing to people who need them; every export is logged.
-- **Third party:** photos are sent to the Anthropic API to be read.
+- **No third party by default:** with the default Ollama engine, photos are read on your own computer and never sent anywhere. Only the optional `anthropic` engine sends photos to an outside API.
 
 ### Deploying the web app
 

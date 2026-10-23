@@ -1,4 +1,4 @@
-"""Desktop app: pick photos, let Claude read them, review/correct each one, then save."""
+"""Desktop app: pick photos, let the AI read them, review/correct each one, then save."""
 import getpass
 import os
 import queue
@@ -9,6 +9,7 @@ from tkinter import filedialog, messagebox, ttk
 from PIL import Image, ImageOps, ImageTk
 
 from .crypto import Cipher, ConfigError
+from . import extract
 from .extract import ExtractionError, extract_fields
 from .forms import DRUG_TEST, FormTemplate, normalize, validate
 from .storage import Database
@@ -16,7 +17,7 @@ from .storage import Database
 DB_FILE = os.environ.get("DRUGTEST_DB", "drugtest.db")
 LEGACY_CSV = os.environ.get("DRUGTEST_CSV", "DrugTestingOrganizer.csv")
 ACTOR = f"desktop:{getpass.getuser()}"
-PARALLEL_READS = 3
+PARALLEL_READS = extract.PARALLEL
 PREVIEW_SIZE = (420, 520)
 
 

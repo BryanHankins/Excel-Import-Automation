@@ -6,8 +6,8 @@
         actually says (leave a cell empty if the form left it blank, or put ? to
         skip that field for that photo).
   3. python -m drugtest_import.evaluate run FOLDER --form drug-test
-     -> reads every photo with the AI (this calls the paid API), compares against
-        labels.csv and prints a report. Per-field results go to
+     -> reads every photo with the AI (by default a free local model via Ollama),
+        compares against labels.csv and prints a report. Per-field results go to
         FOLDER/accuracy-results.csv.
 
 The results and labels contain the forms' contents, so keep them as private as the photos.
@@ -25,7 +25,8 @@ from .forms import BUILT_IN_FORMS, FormTemplate, normalize
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 SKIP = "?"
-# USD per million tokens (input, output). Update when prices change.
+# USD per million tokens (input, output) for paid API models. Update when prices change.
+# Local Ollama models cost nothing per photo.
 PRICES = {
     "claude-opus-5-5": (4.00, 20.00),
     "claude-sonnet-5-5": (2.00, 10.00),
@@ -35,7 +36,14 @@ PRICES = {
 
 
 def find_images(folder: str) -> list[str]:
+    check_folder(folder)
     return sorted(f for f in os.listdir(folder) if os.path.splitext(f)[1].lower() in IMAGE_EXTENSIONS)
+
+
+def check_folder(folder: str) -> None:
+    if not os.path.isdir(folder):
+        raise ValueError(f"The folder {os.path.abspath(folder)} doesn't exist. Create it and copy your form photos "
+                         f"into it first.")
 
 
 def load_form(key: str) -> FormTemplate:
@@ -81,6 +89,9 @@ def load_labels(folder: str, form: FormTemplate) -> dict[str, dict]:
     """{file name: {field key: expected value, or SKIP}} from labels.csv (headers = labels or keys)."""
     by_header = {f.key: f.key for f in form.fields} | {f.label.lower(): f.key for f in form.fields}
     labels = {}
+    check_folder(folder)
+    if not os.path.exists(os.path.join(folder, "labels.csv")):
+        raise ValueError(f"No labels.csv in {os.path.abspath(folder)}. Run 'init' first, then fill it in.")
     with open(os.path.join(folder, "labels.csv"), newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         unknown = [h for h in reader.fieldnames or [] if h != "file" and (h or "").lower() not in by_header]
@@ -123,21 +134,27 @@ class Report:
     seconds: float = 0.0
     documents: int = 0
 
+    engine: str = "ollama"
+
     def cost(self) -> float | None:
+        if self.engine == "ollama":
+            return 0.0
         if len(self.models) != 1 or (model := next(iter(self.models))) not in PRICES:
             return None
         price_in, price_out = PRICES[model]
         return (self.input_tokens * price_in + self.output_tokens * price_out) / 1_000_000
 
 
-def evaluate(folder: str, form: FormTemplate, workers: int = 3, limit: int | None = None,
-             reader=extract.read_form, progress=None) -> Report:
+def evaluate(folder: str, form: FormTemplate, workers: int | None = None, limit: int | None = None,
+             reader=None, progress=None) -> Report:
+    reader = reader or extract.read_form
+    workers = workers or extract.PARALLEL
     labels = load_labels(folder, form)
     missing = [name for name in labels if not os.path.exists(os.path.join(folder, name))]
     if missing:
         raise ValueError(f"labels.csv lists files that aren't in {folder}: {', '.join(missing[:5])}")
     names = list(labels)[:limit] if limit else list(labels)
-    report = Report(form=form, documents=len(names))
+    report = Report(form=form, documents=len(names), engine=extract.ENGINE)
     started = time.monotonic()
 
     def run(name):
@@ -207,13 +224,18 @@ def summary(report: Report) -> str:
             lines.append(f"  ... and {len(silent) - 20} more in accuracy-results.csv")
     if report.failures:
         lines += ["", "Couldn't read:"] + [f"  {name}: {error}" for name, error in report.failures.items()]
-    lines += ["", f"Time: {report.seconds:.0f}s"]
+    lines += ["", f"Time: {report.seconds:.0f}s" + (f" ({report.seconds / report.documents:.1f}s per photo)"
+                                                    if report.documents else "")]
     if read_ok:
         lines.append(f"Tokens per photo: {report.input_tokens / read_ok:,.0f} in, {report.output_tokens / read_ok:,.0f} out"
                      f" (model: {', '.join(sorted(report.models))})")
         cost = report.cost()
-        lines.append(f"Cost: ${cost:.4f} total, ${cost / read_ok:.4f} per photo" if cost is not None
-                     else "Cost: unknown model price - see PRICES in evaluate.py")
+        if report.engine == "ollama":
+            lines.append("Cost: $0 - runs on this computer")
+        elif cost is not None:
+            lines.append(f"Cost: ${cost:.4f} total, ${cost / read_ok:.4f} per photo")
+        else:
+            lines.append("Cost: unknown model price - see PRICES in evaluate.py")
     return "\n".join(lines)
 
 
@@ -235,9 +257,9 @@ def main(argv=None) -> int:
     for sub in (init, run):
         sub.add_argument("folder")
         sub.add_argument("--form", default="drug-test", help="form type key")
-    run.add_argument("--workers", type=int, default=3, help="photos read in parallel")
+    run.add_argument("--workers", type=int, help="photos read in parallel (default: 1 for Ollama)")
     run.add_argument("--limit", type=int, help="only the first N photos")
-    run.add_argument("--model", help="override the model, e.g. claude-sonnet-5-5")
+    run.add_argument("--model", help="override the model, e.g. gemma3:12b")
     args = parser.parse_args(argv)
 
     try:
@@ -249,6 +271,7 @@ def main(argv=None) -> int:
             return 0
         if args.model:
             extract.MODEL = args.model
+        print(f"Reading with {extract.ENGINE} model {extract.MODEL}", file=sys.stderr)
 
         def progress(done, total, name, error):
             print(f"\r{done}/{total} read{' - ' + name + ' failed' if error else ''}", end="", file=sys.stderr)
@@ -259,7 +282,7 @@ def main(argv=None) -> int:
         write_results(report, results_path)
         print(summary(report))
         print(f"\nPer-field results: {results_path}")
-    except (ValueError, OSError) as e:
+    except (ValueError, OSError, extract.ExtractionError) as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1
     return 0

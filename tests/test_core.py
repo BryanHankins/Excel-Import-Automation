@@ -4,7 +4,6 @@ import sqlite3
 from datetime import date
 from types import SimpleNamespace
 
-import anthropic
 import pytest
 from openpyxl import load_workbook
 from PIL import Image
@@ -17,10 +16,6 @@ from drugtest_import.forms import (DRUG_TEST, EQUIPMENT_INSPECTION, SAFETY_INCID
                                    normalize_date, validate)
 from drugtest_import.storage import Database, FormInUse
 
-try:
-    import httpx2 as httpx
-except ImportError:  # older SDKs use httpx
-    import httpx
 
 KEY = generate_key()
 GOOD = {"employee_id": "emp005", "name": " Bob  Wilson ", "department": "Sales", "test_date": "9/18/2025",
@@ -107,8 +102,15 @@ def png_file(size=(3000, 2000)):
     return buffer
 
 
-def test_extract_fields_through_real_sdk():
-    """Runs the real Anthropic SDK against a fake HTTP server to check the request and parsing."""
+def test_extract_fields_through_real_sdk(monkeypatch):
+    """Runs the real Anthropic SDK (optional engine) against a fake HTTP server to check the request and parsing."""
+    anthropic = pytest.importorskip("anthropic")
+    try:
+        import httpx2 as httpx
+    except ImportError:  # older SDKs use httpx
+        import httpx
+    monkeypatch.setattr(extract, "ENGINE", "anthropic")
+    monkeypatch.setattr(extract, "MODEL", "claude-opus-5-5")
     sent = {}
 
     def handler(request):
@@ -140,7 +142,9 @@ class FakeClient:
 
 
 @pytest.mark.parametrize("stop_reason", ["refusal", "max_tokens"])
-def test_extract_fields_raises_on_bad_stop(stop_reason):
+def test_extract_fields_raises_on_bad_stop(stop_reason, monkeypatch):
+    pytest.importorskip("anthropic")
+    monkeypatch.setattr(extract, "ENGINE", "anthropic")
     client = FakeClient(SimpleNamespace(stop_reason=stop_reason, parsed_output=None))
     with pytest.raises(extract.ExtractionError):
         extract.extract_fields(png_file((10, 10)), DRUG_TEST, client=client)
