@@ -111,6 +111,31 @@ The report shows:
 
 Use `--limit 5` for a quick trial and `--model <name>` to compare models (pull each one with `ollama pull` first). Per-field results are written to `photos/accuracy-results.csv`. That file and `labels.csv` contain form contents, so keep them as private as the photos.
 
+#### No real forms yet? Make practice ones
+
+`samples` creates practice forms with made-up people. The answer sheet (`labels.csv`) is filled in for you.
+
+- **Instant check:** draws the forms itself in a handwriting-style font, slightly tilted and blurred like phone photos:
+  ```
+  python -m drugtest_import.samples make practice --form drug-test --count 20 --synthetic
+  python -m drugtest_import.evaluate run practice --form drug-test
+  ```
+  Typed "handwriting" is much neater than real writing, so this **overstates** accuracy. Use it to check everything works and to compare models.
+
+- **Realistic test:** real handwriting on printed forms:
+  ```
+  python -m drugtest_import.samples make handwritten --form drug-test --count 20
+  ```
+  1. Open `handwritten/print-forms.html` in a browser and print it.
+  2. Fill in each form by hand from the answer key at the end, ideally with several people's handwriting.
+  3. Photograph the forms in order and copy the photos into `handwritten/`.
+  4. Run:
+     ```
+     python -m drugtest_import.samples rename handwritten      # names them form-01, form-02, ... in the order taken
+     python -m drugtest_import.evaluate run handwritten --form drug-test
+     ```
+  These numbers are the ones to quote to customers.
+
 ### Other admin commands
 
 ```
